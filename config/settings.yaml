@@ -1,0 +1,170 @@
+# ============================================================
+# TraderBot Configuration
+# ============================================================
+
+# --- Account ---
+account:
+  starting_balance: 11000
+  currency: "USD"
+  hard_floor: 9000                   # Emergency shutdown if balance drops here
+
+# --- Broker ---
+broker:
+  name: "mt5"
+  environment: "demo"                # "demo" or "live"
+  mt5_terminal_path: ""              # Path to MT5 terminal.exe (auto-detect if empty)
+  mt5_server: ""                     # e.g., "Exness-MT5Trial7" (from .env)
+  tick_poll_interval_ms: 100         # Polling interval for price stream
+  max_retries: 3
+  retry_delay_seconds: 1
+  reconnect_max_attempts: 10
+  reconnect_backoff_max_seconds: 60
+
+# --- Trading ---
+trading:
+  style: "scalping"
+  max_trades_per_day: 60
+  max_hold_minutes: 45
+  typical_hold_minutes: 15
+  trading_sessions:                  # UTC hours when trading is allowed
+    forex:
+      start_hour: 7                  # London open
+      end_hour: 20                   # NY close
+    gold:
+      start_hour: 13                 # London + NY overlap
+      end_hour: 17
+    jpyforex:
+      start_hour: 2                  # Tokyo open (includes Asian session)
+      end_hour: 20                   # NY close
+  min_seconds_between_trades: 60     # Prevent rapid-fire entries
+
+# --- Risk Management ---
+risk:
+  risk_per_trade_pct: 2.5            # % of balance risked per trade
+  daily_drawdown_limit_pct: 4.0      # Stop trading if daily loss hits this
+  weekly_drawdown_limit_pct: 8.0     # Stop for the week
+  max_effective_leverage: 5.0        # Cap effective leverage
+  max_open_positions: 6              # Max simultaneous positions
+  max_spread_multiplier: 2.0         # Skip if spread > 2x average
+
+  # Stop-loss & Take-profit
+  sl_atr_multiplier: 1.5            # SL = 1.5 * ATR
+  tp_atr_multiplier: 2.5            # TP = 2.5 * ATR (1.67:1 R:R), trailing captures exits
+  min_sl_pips: 5                    # Floor for SL distance
+  max_sl_pips: 20                   # Cap for SL distance
+  trailing_stop_enabled: true
+  trailing_stop_activation_rr: 1.0   # Activate trailing after 1:1 R:R
+  trailing_stop_atr_multiplier: 1.0  # Trail by 1 * ATR
+
+  # Circuit breakers
+  consecutive_loss_reduce_at: 3      # Halve size after N consecutive losses
+  consecutive_loss_pause_at: 5       # Pause trading after N consecutive losses
+  pause_duration_minutes: 30
+  min_win_rate_threshold: 0.45       # Pause if win rate drops below this
+  min_win_rate_lookback: 100         # Over last N trades
+
+  # Volatility filters
+  high_volatility_atr_ratio: 2.0     # ATR > 2x normal → reduce size 50%
+  low_volatility_atr_ratio: 0.3      # ATR < 0.3x normal → skip trading
+
+# --- Indicators ---
+indicators:
+  ema:
+    fast_period: 8
+    slow_period: 21
+  rsi:
+    period: 14
+    overbought: 75
+    oversold: 25
+  atr:
+    period: 14
+    baseline_period: 50              # For volatility ratio calculation
+  macd:
+    fast_period: 12
+    slow_period: 26
+    signal_period: 9
+  bollinger:
+    period: 20
+    std_dev: 2.0
+    squeeze_percentile: 20           # Width below 20th percentile = squeeze
+
+# --- Timeframes ---
+timeframes:
+  trend: "M15"                       # 15-minute for trend direction
+  entry: "M1"                        # 1-minute for entry timing
+
+# --- ML Model ---
+ml:
+  model_type: "xgboost"
+  confidence_threshold_high: 0.55    # Trade freely above this
+  confidence_threshold_low: 0.50     # Trade only with indicator confirmation
+  retrain_trade_interval: 500        # Retrain every N trades
+  retrain_time_interval_days: 14     # Or every N days
+  min_training_samples: 2000
+  walk_forward_test_months: 2
+  auto_swap_in_demo: true            # Auto-deploy new model in demo
+  auto_swap_in_live: false           # Require human approval in live
+  xgboost:
+    n_estimators: 500
+    max_depth: 5
+    learning_rate: 0.03
+    min_child_weight: 5
+    subsample: 0.8
+    colsample_bytree: 0.8
+    gamma: 0.5
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    early_stopping_rounds: 0
+    scale_pos_weight: 1.0            # Balanced after excluding neutral-trend candles
+
+# --- Historical Data ---
+data:
+  history_months: 12                 # Months of historical data to fetch
+  cache_format: "parquet"
+  max_candle_gap_minutes: 5          # Flag gaps larger than this
+  bad_tick_atr_threshold: 5          # Reject ticks > 5 ATR from prior close
+  candle_granularity: "M1"           # 1-minute candles from broker
+
+# --- Growth & Reinvestment ---
+growth:
+  target_balance: 6000
+  reinvest_pct_growth_phase: 100     # 100% reinvest until target
+  reinvest_pct_harvest_phase: 50     # 50% reinvest after target
+  milestones: [750, 1000, 2000, 3000, 6000]
+
+# --- Monitoring ---
+monitoring:
+  log_level: "INFO"
+  log_format: "json"
+  trade_journal_db: "data/trade_logs/trades.db"
+  reconciliation_interval_seconds: 60
+  streamlit_port: 8501
+
+# --- AI Analyst (Claude) ---
+ai_analyst:
+  enabled: true                       # Set to false to disable entirely
+  api_key_env: "ANTHROPIC_API_KEY"    # Env var name for the API key
+  model: "claude-sonnet-4-6"          # Model for trade reviews & briefings
+  regime_model: "claude-haiku-4-5-20251001"  # Cheaper model for regime checks
+  require_approval: false             # true = block trades without Claude OK
+                                      # false = Claude advises, XGBoost decides
+  min_ml_confidence_for_review: 0.45  # Only send trades above this to Claude
+  regime_check_interval_minutes: 30   # How often to check market regime
+  session_briefing_enabled: true      # Pre-session analysis
+  session_review_enabled: true        # Post-session analysis
+  shadow_enabled: true                # End-of-day retrospective paper trading
+  shadow_review_hour_utc: 21          # Run retrospective at 9 PM UTC (11 PM SAST)
+  approval_ttl_seconds: 300           # Trade recommendations expire after 5 minutes
+  approval_max_slippage_pips: 5       # Max price movement allowed when executing approved trade
+
+# --- Telegram ---
+telegram:
+  enabled: true
+  alert_on_trade_open: true
+  alert_on_trade_close: true
+  alert_on_daily_stop: true
+  alert_on_emergency_stop: true
+  alert_on_ml_retrain: true
+  alert_on_api_error: true
+  alert_on_milestone: true
+  daily_summary_hour_utc: 21         # Send daily summary at 9 PM UTC

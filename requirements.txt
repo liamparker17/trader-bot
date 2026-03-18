@@ -1,0 +1,33 @@
+# MetaTrader 5 / Exness
+MetaTrader5>=5.0.45
+requests>=2.31.0
+
+# Data handling
+pandas>=2.1.0
+numpy>=1.24.0
+pyarrow>=14.0.0
+
+# Technical indicators
+# pandas-ta removed — indicators implemented manually in src/indicators/
+
+# Machine Learning
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+joblib>=1.3.0
+
+# Dashboard
+streamlit>=1.29.0
+plotly>=5.18.0
+
+# Telegram alerts
+python-telegram-bot>=20.7
+
+# Configuration
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+
+# AI Analyst (optional — bot runs without it)
+anthropic>=0.40.0
+
+# Logging
+structlog>=23.2.0

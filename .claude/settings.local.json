@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init:*)",
+      "Bash(mkdir:*)",
+      "Bash(do touch:*)",
+      "Bash(python:*)",
+      "Bash(source:*)",
+      "Bash(find .:*)",
+      "WebSearch",
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(pip install:*)",
+      "Bash(test:*)",
+      "Bash(rm:*)",
+      "Bash(taskkill:*)"
+    ]
+  }
+}

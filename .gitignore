@@ -1,0 +1,39 @@
+# Environment
+.env
+secrets.env
+config/secrets.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files (too large for git)
+data/historical/*.parquet
+data/trade_logs/*.db
+data/trade_logs/*.sqlite
+
+# ML models (large binary files)
+src/ml/model_store/*.joblib
+src/ml/model_store/*.pkl
+src/ml/model_store/*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Streamlit
+.streamlit/
+
+# Logs
+*.log
+logs/
+
+# Installers
+*.exe
