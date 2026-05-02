@@ -1,8 +1,10 @@
 # Autonomous VPS Deployment + Claude-Code CLI Control
 
 **Date:** 2026-05-02
-**Status:** Approved (design); audit findings TBD
+**Status:** Approved (design + audit findings); ready for implementation plan
 **Author brainstorm with:** Liam Parker
+
+> **Currency convention:** all monetary values in this document and in the implementation are denominated in **South African Rand (ZAR)**. The Exness account is opened with ZAR as the base currency. MT5 reports balance/P&L in account currency, which the bot uses verbatim — no conversion arithmetic.
 
 ## Goal
 
@@ -111,8 +113,8 @@ Success at the end of the month-long run = a confident go/no-go on live capital,
 
 ### Un-overridable hard floors (locked in `config/safety_floor.yaml`, never tunable)
 
-- `risk.daily_drawdown_stop_pct = 4` — hard stop the day at -4%.
-- `risk.hard_floor_balance = 9000` — kill switch if equity drops here.
+- `risk.daily_drawdown_stop_pct = 4` — hard stop the day at -4%. Reset at session boundary (21:00 UTC, see audit finding E).
+- `risk.hard_floor_balance_zar = 9000` — kill switch if equity drops here. **Explicitly ZAR.**
 - `risk.max_leverage_effective = 5`.
 - `circuit_breaker.api_error_threshold = 10`.
 - `circuit_breaker.spread_blowout_pause_minutes = 30`.
@@ -170,3 +172,66 @@ Before any of this can run unattended for a month, the existing code must be ver
 - **Loadshedding-equivalent at Hetzner is rare but nonzero** — Hetzner SLAs are good but not perfect. Acceptable for a demo; revisit before live.
 - **Claude Code reasoning errors during a `tune`** — the developer is the human-in-the-loop. The CLI will refuse out-of-band tunes; rationale is logged and Telegram-broadcast so the developer sees every change.
 - **Audit could surface ship-blocking issues that delay the project significantly** — that's the point of doing the audit. Better to find them now than during a live run.
+
+---
+
+## Audit Findings (2026-05-02)
+
+Six parallel read-only audit agents were dispatched against `main.py`, the MT5 client + data layer, the risk + circuit breaker stack, the executor + position lifecycle, the monitoring + journal layer, and the existing `src/ai/` scaffolding. Findings consolidated below. All blockers and fixes go into the implementation plan; nice-to-haves are deferred to a later cycle.
+
+### 🚫 Blockers (11) — must be fixed before any unattended run
+
+| # | Module | Finding | Fix direction |
+|---|---|---|---|
+| A | `src/main.py` | No single-instance lock — two bot copies could trade the same account | Add lock file at `data/traderbot.lock` checked in `setup()` |
+| B1 | `mt5_client.py:128` | Broker disconnect not detected when MT5 terminal stays initialized | New `is_broker_connected()` health probe per loop |
+| B2 | `mt5_client.py:384-410` | `stream_prices()` has no exponential backoff; 100ms spam-loop forever | Backoff with jitter; cap retries |
+| B3 | `collector.py:150-157` | Stream errors counted but trading is not paused during outage | On disconnect: pause new entries, alert Telegram, retry, alert on reconnect |
+| C | `settings.yaml:9` + `circuit_breaker.py:45` | Hard-floor unit confusion (settings says `9000`, breaker defaults to `350`) | Rename key to `hard_floor_balance_zar`, set value to `9000`, lock in `safety_floor.yaml` |
+| D | `drawdown_tracker.py:31-32`, `manager.py:142-145` | Drawdown breach pauses entries but doesn't close open positions | On 4% breach: emergency `close_all("daily_drawdown")` + Telegram alert |
+| E | `drawdown_tracker.py:156-171` | Daily reset at UTC midnight (= 02:00 SAST mid-Asian-session) | Reset at **21:00 UTC** (NYSE close, conventional forex day boundary) |
+| F | `circuit_breaker.py:78-82, 65-75` | Consecutive losses don't reset on day boundary | Reset alongside (E) at 21:00 UTC |
+| G | `executor.py:192-195` | Trade ID falls back to timestamp on missing MT5 ticket | Require MT5 ticket; fail loudly + Telegram if missing |
+| H | `telegram_bot.py:413` | `daily_summary()` exists but is never called | Internal scheduler fires `daily_summary()` at 21:00 UTC |
+| I | `telegram_bot.py` | No alerts for MT5 connect / disconnect / reconnect | Wire to (B) outcome path |
+
+### 🔧 Fixes (10) — should be done before unattended run
+
+| # | Module | Finding |
+|---|---|---|
+| J | runbook | NSSM watchdog config must specify `RestartDelay=10000`, `AppRotateFiles=1` |
+| K | `main.py`, `evaluator.py` | ML retraining checkpoints not persisted incrementally |
+| L | `mt5_client.py:631-662` | Broker-suffix detection runs once at startup; no re-detection on reconnect |
+| M | `historical_loader.py`, `candle_builder.py` | Tick-timestamp parsing unvalidated; risk of mixing naive/aware datetimes |
+| N | `mt5_client.py:456` | Order deviation hard-coded at 20 points; should be spread-aware |
+| O | `executor.py:186-189` | Fill-transaction structure not strictly validated; up to 60s blind window |
+| P | `mt5_client.py:478-482` | All non-DONE retcodes hard-fail; no retry for transient requotes |
+| Q | `executor.py:195` | Trade-ID validation (collapses with G — same code change) |
+| R | `trade_journal.py:50-68` | No fee/swap columns — net P&L not fully reconstructable |
+| S | `telegram_bot.py` | General exception alerting incomplete (only API errors alert) |
+
+### 🟢 Nice-to-haves (deferred)
+
+Streaming-thread healthcheck; Friday pre-close trading guard; Monday weekend-gap detection; network-flap candle-gap alerting; breakeven-SL min-distance retry; orphan-trade adoption; `control_log` migration pattern; position-sizer fairness on tiny balances.
+
+### 🧹 AI scaffolding decisions (cleanup)
+
+`analyst.py` is currently wired into `main.py:373-383` and calls the Anthropic API on every trade signal. Since the new design eliminates background LLM-in-the-loop, this and related scaffolding are removed.
+
+| File | Action |
+|---|---|
+| `src/ai/analyst.py` | DELETE — unwire from `main.py:373-383` first |
+| `src/ai/shadow_trader.py` | DELETE |
+| `src/ai/__init__.py` | DELETE |
+| `src/ai/prompts.py` | DELETE |
+| `src/ai/approval_queue.py` | REPURPOSE as `src/control/queue.py`; rename methods `approve/reject` → `apply/cancel` |
+| `TRADING_BRAIN.md` | MOVE to `docs/personas/trading-brain.md` (paste-in context for ad-hoc local Claude Code reasoning, not part of the bot) |
+
+### Updated implementation phases (replaces the original Phase 1-6 list above)
+
+1. **Hardening — blockers** (A through I): single-instance lock, MT5 disconnect handling, hard-floor unit fix, drawdown emergency-close, session-boundary reset, trade-ID fix, daily summary scheduler, MT5 connection alerts.
+2. **Hardening — fixes** (J through S): NSSM runbook, ML checkpointing, suffix re-detection, timestamp validation, spread-aware deviation, fill validation + retry, journal fee columns, general exception alerting.
+3. **AI scaffolding cleanup**: unwire `analyst.py` from `main.py`, delete files per the table, repurpose `approval_queue.py` as the control queue, move `TRADING_BRAIN.md`.
+4. **Control plane**: build `cli/tb.py` (read + write commands), the `control_log` table, the safety-floor config loader, and Telegram hooks for write commands.
+5. **VPS provisioning runbook**: short Markdown doc with exact steps for Hetzner provisioning, MT5 install + auto-login, NSSM service install with verified config, SSH key setup for the local `tb` alias.
+6. **48-hour shakedown on demo**: run on the VPS for 2 days, exercise every CLI command, force a restart and verify clean recovery, verify daily summary fires. Only after this passes does the month-long test begin.
