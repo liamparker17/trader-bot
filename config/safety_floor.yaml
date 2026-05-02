@@ -1,0 +1,13 @@
+# ============================================================
+# Safety Floor — values that always win over settings.yaml and
+# any runtime tunes. The CLI rejects any tune that targets a
+# key listed here. If you need to change one of these, you must
+# do it by hand and restart the bot.
+# ============================================================
+risk:
+  daily_drawdown_stop_pct: 4.0        # Hard stop the day at -4%
+  hard_floor_zar: 9000                # Kill switch if equity drops here (ZAR)
+  max_leverage_effective: 5.0         # Cap effective leverage
+circuit_breaker:
+  api_error_threshold: 10             # Pause if more than N API errors in 10 min
+  spread_blowout_pause_minutes: 30    # Pause an instrument for N min after blowout
