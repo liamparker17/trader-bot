@@ -124,7 +124,7 @@ class TraderBot:
         except Exception as e:
             logger.error(f"Failed to get account balance: {e}")
             logger.info("Continuing with configured starting balance...")
-            starting = self.config.get("account.starting_balance", 500)
+            starting = self.config.get("account.starting_balance_zar", 500)
             self.risk_manager.initialize(starting)
             self.growth.initialize(starting)
 
