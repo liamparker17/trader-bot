@@ -4,9 +4,14 @@ secrets.env
 config/secrets.env
 venv/
 .venv/
+.worktrees/
 __pycache__/
 *.pyc
 *.pyo
+
+# Control plane runtime files (created on the VPS at runtime)
+data/control/
+data/traderbot.lock
 
 # Data files (too large for git)
 data/historical/*.parquet
