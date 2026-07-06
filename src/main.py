@@ -18,6 +18,7 @@ import threading
 from pathlib import Path
 
 from src.config import load_config
+from src.utils.instance_lock import InstanceLock
 from src.data.mt5_client import MT5Client
 from src.data.collector import DataCollector
 from src.indicators.engine import IndicatorEngine
@@ -60,12 +61,23 @@ class TraderBot:
         self.analyst = None
         self.shadow = None
         self.approval_queue = None
+        self.instance_lock = InstanceLock()
 
     def setup(self):
         """Initialize all modules."""
         logger.info("Initializing TraderBot...")
         logger.info(f"Environment: {self.config.broker_environment}")
         logger.info(f"Instruments: {self.config.get_enabled_instruments()}")
+
+        # Single-instance lock — must succeed before any MT5 connection
+        # is attempted, so two bot processes can never trade the same
+        # account concurrently.
+        if not self.instance_lock.acquire():
+            logger.critical(
+                "Could not acquire single-instance lock. "
+                "Another TraderBot process appears to be running. Exiting."
+            )
+            sys.exit(1)
 
         # Validate credentials
         if not self.config.mt5_login:
@@ -917,6 +929,10 @@ class TraderBot:
         # Close API sessions
         if self.client:
             self.client.close()
+
+        # Release single-instance lock last, once everything else is torn down
+        if self.instance_lock:
+            self.instance_lock.release()
 
         logger.info("TraderBot shutdown complete.")
 
