@@ -241,6 +241,43 @@ class TelegramBot:
         self._send(text)
 
     # ------------------------------------------------------------------
+    # MT5 connectivity alerts
+    # ------------------------------------------------------------------
+
+    def mt5_connected(self, environment: str = ""):
+        """Alert: MT5 broker connection established. Best-effort, never raises."""
+        try:
+            text = "\U0001f7e2 <b>MT5 Connected</b>"
+            if environment:
+                text += f"\nEnvironment: {environment}"
+            self._send(text)
+        except Exception as e:
+            logger.warning(f"mt5_connected alert failed: {e}")
+
+    def mt5_disconnected(self, reason: str = "connection lost"):
+        """Alert: MT5 broker connection lost, new entries paused. Best-effort, never raises."""
+        try:
+            text = (
+                f"\U0001f6ab <b>MT5 Disconnected</b>\n"
+                f"Reason: {reason}\n"
+                f"New entries paused until reconnect."
+            )
+            self._send(text)
+        except Exception as e:
+            logger.warning(f"mt5_disconnected alert failed: {e}")
+
+    def mt5_reconnected(self):
+        """Alert: MT5 broker connection restored, trading resumed. Best-effort, never raises."""
+        try:
+            text = (
+                "✅ <b>MT5 Reconnected</b>\n"
+                f"Trading resumed."
+            )
+            self._send(text)
+        except Exception as e:
+            logger.warning(f"mt5_reconnected alert failed: {e}")
+
+    # ------------------------------------------------------------------
     # Reports
     # ------------------------------------------------------------------
 

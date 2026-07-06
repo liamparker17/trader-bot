@@ -15,6 +15,7 @@ Handles:
 """
 
 import logging
+import random
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Generator
@@ -68,6 +69,13 @@ class MT5Client:
         self.login = int(config.mt5_login) if config.mt5_login else 0
         self.password = config.mt5_password or ""
         self.server = config.mt5_server or ""
+
+        # Set by cancel_stream() to promptly interrupt an in-progress
+        # stream_prices() generator (including mid-backoff-sleep), instead
+        # of leaving DataCollector.stop_streaming() to wait out a sleep of
+        # up to `max_backoff` seconds. Reset at the start of every
+        # stream_prices() call.
+        self._stream_cancelled = False
 
     # ------------------------------------------------------------------
     # Connection management
@@ -130,6 +138,47 @@ class MT5Client:
             self._connected = False
             if not self.connect():
                 raise MT5Error("Failed to reconnect to MT5")
+
+    def is_broker_connected(self) -> bool:
+        """
+        Cheap health probe for the MT5 terminal/broker connection.
+
+        Checks terminal_info().connected AND that account_info() is
+        available. Never raises — any failure is treated as disconnected.
+        Intended to be called once per main-loop iteration.
+        """
+        try:
+            terminal = mt5.terminal_info()
+            if terminal is None or not getattr(terminal, "connected", False):
+                return False
+            return mt5.account_info() is not None
+        except Exception as e:
+            logger.warning(f"is_broker_connected() check failed: {e}")
+            return False
+
+    def cancel_stream(self):
+        """
+        Request that an in-progress stream_prices() generator exit promptly.
+
+        Checked between chunked sleep steps (see `_interruptible_sleep`), so
+        calling this during a multi-second backoff sleep interrupts it
+        within one chunk (~0.1s) instead of blocking until the sleep
+        completes. Safe to call even if no stream is running.
+        """
+        self._stream_cancelled = True
+
+    def _interruptible_sleep(self, total_seconds: float, chunk: float = 0.1) -> None:
+        """
+        Sleep for `total_seconds`, checking `self._stream_cancelled` every
+        `chunk` seconds so a long backoff sleep in stream_prices() can be
+        cut short by cancel_stream() instead of blocking for the full
+        duration (up to `max_backoff`).
+        """
+        remaining = total_seconds
+        while remaining > 0 and not self._stream_cancelled:
+            step = min(chunk, remaining)
+            time.sleep(step)
+            remaining -= step
 
     # ------------------------------------------------------------------
     # Account
@@ -378,7 +427,14 @@ class MT5Client:
         last_ticks = {}
         logger.info(f"Price polling started for {instruments}")
 
-        while True:
+        consecutive_errors = 0
+        base_backoff = 1.0
+        max_backoff = 60.0
+        self._stream_cancelled = False
+
+        while not self._stream_cancelled:
+            loop_had_error = False
+
             for sym in symbols:
                 try:
                     tick = mt5.symbol_info_tick(sym)
@@ -405,9 +461,35 @@ class MT5Client:
 
                 except Exception as e:
                     logger.warning(f"Tick error for {sym}: {e}")
+                    loop_had_error = True
 
-            # Poll interval — ~100ms for responsive candle building
-            time.sleep(0.1)
+            if loop_had_error:
+                # Probe as diagnosis, not as gate: only consult
+                # is_broker_connected() once we already know this iteration
+                # errored, to log a clearer signal. A transient probe blip
+                # must NOT by itself force backoff while ticks are otherwise
+                # flowing fine — that was a self-inflicted throttle.
+                if not self.is_broker_connected():
+                    logger.warning(
+                        "Broker connectivity probe confirms disconnect during stream error"
+                    )
+
+                consecutive_errors += 1
+                raw_delay = base_backoff * (2 ** (consecutive_errors - 1))
+                capped_delay = min(raw_delay, max_backoff)
+                jitter = random.uniform(0, capped_delay * 0.1)
+                sleep_time = min(capped_delay + jitter, max_backoff)
+                logger.warning(
+                    f"MT5 stream degraded (consecutive errors={consecutive_errors}); "
+                    f"backing off {sleep_time:.1f}s"
+                )
+                self._interruptible_sleep(sleep_time)
+            else:
+                consecutive_errors = 0
+                # Poll interval — ~100ms for responsive candle building
+                self._interruptible_sleep(0.1)
+
+        logger.info("Price stream cancelled")
 
     # ------------------------------------------------------------------
     # Orders
