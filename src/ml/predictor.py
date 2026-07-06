@@ -45,6 +45,12 @@ class Predictor:
         self.threshold_high = ml_config.get("confidence_threshold_high", 0.65)
         self.threshold_low = ml_config.get("confidence_threshold_low", 0.55)
 
+        # Optional EffectiveConfig overlay (Task 8): when set, thresholds are
+        # read through it at each signal so a `tb tune` command takes effect
+        # immediately without a restart. Falls back to the cached values
+        # above when unset (tests / callers that don't wire it in).
+        self.effective_config = None
+
     def load_model(self, version: str = None) -> bool:
         """
         Load a model from the model store.
@@ -176,26 +182,36 @@ class Predictor:
 
         probability = self.predict(features)
 
-        if probability >= self.threshold_high:
+        threshold_high = self.threshold_high
+        threshold_low = self.threshold_low
+        if self.effective_config is not None:
+            threshold_high = self.effective_config.get(
+                "ml.confidence_threshold_high", threshold_high
+            )
+            threshold_low = self.effective_config.get(
+                "ml.confidence_threshold_low", threshold_low
+            )
+
+        if probability >= threshold_high:
             return {
                 "action": "trade",
                 "probability": probability,
                 "confidence": "high",
-                "reason": f"ML confidence {probability:.1%} above high threshold {self.threshold_high:.1%}",
+                "reason": f"ML confidence {probability:.1%} above high threshold {threshold_high:.1%}",
             }
 
-        if probability >= self.threshold_low and indicators_agree:
+        if probability >= threshold_low and indicators_agree:
             return {
                 "action": "trade",
                 "probability": probability,
                 "confidence": "medium",
                 "reason": (
                     f"ML confidence {probability:.1%} above low threshold "
-                    f"{self.threshold_low:.1%} with indicator confirmation"
+                    f"{threshold_low:.1%} with indicator confirmation"
                 ),
             }
 
-        if probability >= self.threshold_low:
+        if probability >= threshold_low:
             return {
                 "action": "skip",
                 "probability": probability,
@@ -210,7 +226,7 @@ class Predictor:
             "action": "skip",
             "probability": probability,
             "confidence": "low",
-            "reason": f"ML confidence {probability:.1%} below threshold {self.threshold_low:.1%}",
+            "reason": f"ML confidence {probability:.1%} below threshold {threshold_low:.1%}",
         }
 
     def get_feature_importance(self) -> dict[str, float]:

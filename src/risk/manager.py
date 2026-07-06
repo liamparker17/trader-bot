@@ -143,6 +143,14 @@ class RiskManager:
         self._blocked_until_boundary: bool = False
         self._block_reason: str = ""
 
+        # Manual pause (Task 8: control queue `pause`/`resume` verbs, and
+        # the main-loop's own session-boundary/drawdown-check exception
+        # handler). Independent of the daily-drawdown block above and of
+        # the circuit breaker's shutdown/resume — this is an operator- or
+        # code-triggered "stop opening new trades" switch that persists
+        # until explicitly cleared (no automatic session-boundary reset).
+        self._manual_pause_reason: str = ""
+
     def initialize(self, balance: float):
         """Initialize with current account balance. Call once at startup."""
         self.drawdown.initialize(balance)
@@ -234,6 +242,11 @@ class RiskManager:
         """
         if not self._initialized:
             return TradeApproval(False, "Risk manager not initialized")
+
+        # Check -1: Manual pause (control queue `pause` verb, or an
+        # exception in the main loop's session-boundary/drawdown checks).
+        if self._manual_pause_reason:
+            return TradeApproval(False, f"Manually paused: {self._manual_pause_reason}")
 
         # Check 0: Session boundary / daily-drawdown emergency block
         self.check_session_boundary(current_balance)
@@ -403,3 +416,23 @@ class RiskManager:
     def force_resume(self):
         """Manual override to resume from pause (not shutdown)."""
         self.circuit_breaker.force_resume()
+
+    @property
+    def manual_paused(self) -> bool:
+        """True while a manual pause (control queue or exception-triggered) is active."""
+        return bool(self._manual_pause_reason)
+
+    @property
+    def manual_pause_reason(self) -> str:
+        return self._manual_pause_reason
+
+    def set_manual_pause(self, reason: str):
+        """Block new entries until `clear_manual_pause()` is called."""
+        self._manual_pause_reason = reason
+        logger.warning(f"Manual pause engaged: {reason}")
+
+    def clear_manual_pause(self):
+        """Lift a manual pause set by `set_manual_pause()`."""
+        if self._manual_pause_reason:
+            logger.info(f"Manual pause cleared (was: {self._manual_pause_reason})")
+        self._manual_pause_reason = ""

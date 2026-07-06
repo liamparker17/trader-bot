@@ -46,6 +46,13 @@ class PositionSizer:
         self.consec_loss_reduce = config.get("risk.consecutive_loss_reduce_at", 3)
         self.high_vol_ratio = config.get("risk.high_volatility_atr_ratio", 2.0)
 
+        # Optional EffectiveConfig overlay (Task 8): when set, the global
+        # risk-per-trade fallback is read through it so a `tb tune` command
+        # takes effect on the next sizing call without a restart. Per-
+        # instrument risk_per_trade_pct overrides in instruments.yaml still
+        # take priority, matching the pre-existing fallback order.
+        self.effective_config = None
+
     def calculate(
         self,
         balance: float,
@@ -86,7 +93,12 @@ class PositionSizer:
         # Per-instrument SL/TP/risk overrides (fall back to global config)
         inst_sl_atr_mult = inst_config.get("sl_atr_multiplier", self.sl_atr_mult)
         inst_tp_atr_mult = inst_config.get("tp_atr_multiplier", self.tp_atr_mult)
-        inst_risk_pct = inst_config.get("risk_per_trade_pct", self.risk_pct * 100) / 100
+        global_risk_pct = self.risk_pct
+        if self.effective_config is not None:
+            global_risk_pct = (
+                self.effective_config.get("risk.risk_per_trade_pct", self.risk_pct * 100) / 100
+            )
+        inst_risk_pct = inst_config.get("risk_per_trade_pct", global_risk_pct * 100) / 100
 
         # Step 1: Calculate SL distance in pips
         sl_pips = atr_value * inst_sl_atr_mult / pip_size
