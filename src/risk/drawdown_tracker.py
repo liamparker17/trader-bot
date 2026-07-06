@@ -11,12 +11,34 @@ Total drawdown: Compared to the all-time high balance (high-water mark).
 
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 from src.config import Config
 from src.risk.ratchet_floor import RatchetFloor
 
 logger = logging.getLogger("traderbot.risk.drawdown")
+
+# Friday, per Python's Monday=0 .. Sunday=6 weekday() convention.
+FRIDAY = 4
+
+
+def session_boundary(now: datetime, reset_hour: int, weekday: Optional[int] = None) -> datetime:
+    """
+    Return the most recent session-boundary timestamp at or before `now`.
+
+    The boundary recurs daily at `reset_hour`:00 UTC. When `weekday` is given
+    (0=Monday .. 6=Sunday), the boundary instead recurs weekly, anchored to
+    that weekday at `reset_hour`:00 UTC (e.g. Friday 21:00 UTC).
+
+    `now` must be timezone-aware (UTC).
+    """
+    candidate = now.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
+    if weekday is not None:
+        days_back = (candidate.weekday() - weekday) % 7
+        candidate -= timedelta(days=days_back)
+    if candidate > now:
+        candidate -= timedelta(days=7 if weekday is not None else 1)
+    return candidate
 
 
 class DrawdownTracker:
@@ -25,12 +47,33 @@ class DrawdownTracker:
 
     Provides real-time drawdown checks that the risk manager uses
     to decide whether to pause trading.
+
+    Daily/weekly counters reset at the trading session boundary
+    (`trading.session_reset_hour_utc`, default 21:00 UTC) rather than at
+    midnight — the week rolls over at Friday 21:00 UTC.
     """
 
-    def __init__(self, config: Config, ratchet_floor: Optional[RatchetFloor] = None):
+    def __init__(
+        self,
+        config: Config,
+        ratchet_floor: Optional[RatchetFloor] = None,
+        clock: Optional[Callable[[], datetime]] = None,
+    ):
         self.config = config
         self.daily_limit = config.get("risk.daily_drawdown_limit_pct", 4.0) / 100
         self.weekly_limit = config.get("risk.weekly_drawdown_limit_pct", 8.0) / 100
+
+        # Injectable clock so tests can freeze/advance time across the
+        # 21:00 UTC session boundary without sleeping. Defaults to real UTC.
+        self.clock: Callable[[], datetime] = clock or (lambda: datetime.now(timezone.utc))
+
+        # Session boundary hour. Falls back to the pre-existing
+        # risk.session_boundary_hour_utc key already present in
+        # config/settings.yaml if the newer trading.* key isn't set.
+        self.session_reset_hour = config.get(
+            "trading.session_reset_hour_utc",
+            config.get("risk.session_boundary_hour_utc", 21),
+        )
 
         # Ratcheting hard floor (replaces the old fixed hard_floor_zar).
         # Same injection pattern as CircuitBreaker — share one RatchetFloor
@@ -57,9 +100,9 @@ class DrawdownTracker:
         self.high_water_mark = balance
         self.daily_start_balance = balance
         self.weekly_start_balance = balance
-        now = datetime.now(timezone.utc)
-        self.current_date = now
-        self.current_week_start = now - timedelta(days=now.weekday())
+        now = self.clock()
+        self.current_date = session_boundary(now, self.session_reset_hour)
+        self.current_week_start = session_boundary(now, self.session_reset_hour, weekday=FRIDAY)
         logger.info(
             f"Drawdown tracker initialized | Balance: R{balance:.2f} | "
             f"Daily limit: {self.daily_limit:.1%} | Weekly limit: {self.weekly_limit:.1%}"
@@ -75,16 +118,17 @@ class DrawdownTracker:
             current_equity: Balance + unrealized PnL (optional, uses balance if not given)
         """
         equity = current_equity if current_equity is not None else current_balance
-        now = datetime.now(timezone.utc)
+        now = self.clock()
 
-        # Check for new day
-        if self.current_date is None or now.date() != self.current_date.date():
-            self._handle_new_day(current_balance, now)
+        # Check for a new trading day (boundary = session_reset_hour:00 UTC)
+        daily_boundary = session_boundary(now, self.session_reset_hour)
+        if self.current_date is None or daily_boundary != self.current_date:
+            self._handle_new_day(current_balance, now, daily_boundary)
 
-        # Check for new week
-        week_start = now - timedelta(days=now.weekday())
-        if self.current_week_start is None or week_start.date() != self.current_week_start.date():
-            self._handle_new_week(current_balance, now)
+        # Check for a new trading week (boundary = Friday session_reset_hour:00 UTC)
+        weekly_boundary = session_boundary(now, self.session_reset_hour, weekday=FRIDAY)
+        if self.current_week_start is None or weekly_boundary != self.current_week_start:
+            self._handle_new_week(current_balance, now, weekly_boundary)
 
         # Update high water mark
         if current_balance > self.high_water_mark:
@@ -163,8 +207,8 @@ class DrawdownTracker:
             return 0.0
         return max(0, (self.daily_start_balance - current_balance) / self.daily_start_balance)
 
-    def _handle_new_day(self, balance: float, now: datetime):
-        """Reset daily tracking."""
+    def _handle_new_day(self, balance: float, now: datetime, boundary: datetime):
+        """Reset daily tracking at the 21:00 UTC session boundary."""
         if self.current_date is not None and self.daily_start_balance > 0:
             # Record previous day's result
             daily_result = {
@@ -177,11 +221,11 @@ class DrawdownTracker:
             self.daily_drawdowns.append(daily_result)
 
         self.daily_start_balance = balance
-        self.current_date = now
-        logger.info(f"New day: daily start balance = R{balance:.2f}")
+        self.current_date = boundary
+        logger.info(f"New session day (boundary {boundary.isoformat()}): daily start balance = R{balance:.2f}")
 
-    def _handle_new_week(self, balance: float, now: datetime):
-        """Reset weekly tracking."""
+    def _handle_new_week(self, balance: float, now: datetime, boundary: datetime):
+        """Reset weekly tracking at the Friday 21:00 UTC session boundary."""
         self.weekly_start_balance = balance
-        self.current_week_start = now - timedelta(days=now.weekday())
-        logger.info(f"New week: weekly start balance = R{balance:.2f}")
+        self.current_week_start = boundary
+        logger.info(f"New session week (boundary {boundary.isoformat()}): weekly start balance = R{balance:.2f}")

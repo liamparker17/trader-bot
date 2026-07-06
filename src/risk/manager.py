@@ -11,11 +11,12 @@ No trade can be placed without the risk manager's approval.
 """
 
 import logging
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Callable, Optional
 
 from src.config import Config
 from src.risk.position_sizer import PositionSizer
-from src.risk.drawdown_tracker import DrawdownTracker
+from src.risk.drawdown_tracker import DrawdownTracker, session_boundary
 from src.risk.circuit_breaker import CircuitBreaker
 from src.risk.ratchet_floor import RatchetFloor
 
@@ -90,18 +91,30 @@ class RiskManager:
     8. Position size calculable?
     """
 
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        clock: Optional[Callable[[], datetime]] = None,
+        ratchet_floor: Optional[RatchetFloor] = None,
+    ):
         self.config = config
+
+        # Injectable clock so tests can freeze/advance time across the
+        # 21:00 UTC session boundary without sleeping. Defaults to real UTC.
+        # Shared with the DrawdownTracker so both agree on "now".
+        self.clock: Callable[[], datetime] = clock or (lambda: datetime.now(timezone.utc))
+
         self.sizer = PositionSizer(config)
 
         # One shared ratchet floor so the high-water mark used by the
         # drawdown tracker's hard-floor check and the circuit breaker's
-        # kill switch always agree.
-        self.ratchet_floor = RatchetFloor(
+        # kill switch always agree. Tests can inject one pointed at a
+        # tmp_path state file to avoid touching data/account_state.json.
+        self.ratchet_floor = ratchet_floor or RatchetFloor(
             min_floor_zar=config.get("risk.min_floor_zar", 600),
             max_total_drawdown_pct=config.get("risk.max_total_drawdown_pct", 0.35),
         )
-        self.drawdown = DrawdownTracker(config, ratchet_floor=self.ratchet_floor)
+        self.drawdown = DrawdownTracker(config, ratchet_floor=self.ratchet_floor, clock=self.clock)
         self.circuit_breaker = CircuitBreaker(config, ratchet_floor=self.ratchet_floor)
 
         self.max_open_positions = config.get("risk.max_open_positions", 3)
@@ -109,16 +122,103 @@ class RiskManager:
         self.low_vol_ratio = config.get("risk.low_volatility_atr_ratio", 0.3)
         self.high_vol_ratio = config.get("risk.high_volatility_atr_ratio", 2.0)
 
+        # Session boundary (21:00 UTC) — daily drawdown block + consecutive
+        # loss counter both reset here. Falls back to the pre-existing
+        # risk.session_boundary_hour_utc key if the newer trading.* key
+        # isn't set (see config/settings.yaml).
+        self.session_reset_hour = config.get(
+            "trading.session_reset_hour_utc",
+            config.get("risk.session_boundary_hour_utc", 21),
+        )
+        self._last_daily_boundary: Optional[datetime] = None
+
         # Runtime state
         self.open_position_count: int = 0
         self.trades_today: int = 0
         self._initialized = False
 
+        # Emergency block state — set when a daily-drawdown breach fires.
+        # Blocks new entries until the next 21:00 UTC session boundary,
+        # independent of the circuit breaker's (manual-resume) shutdown.
+        self._blocked_until_boundary: bool = False
+        self._block_reason: str = ""
+
     def initialize(self, balance: float):
         """Initialize with current account balance. Call once at startup."""
         self.drawdown.initialize(balance)
+        self._last_daily_boundary = session_boundary(self.clock(), self.session_reset_hour)
         self._initialized = True
         logger.info(f"Risk manager initialized with balance R{balance:.2f}")
+
+    def check_session_boundary(self, current_balance: Optional[float] = None) -> bool:
+        """
+        Detect whether the 21:00 UTC session boundary has been crossed since
+        the last check. On crossing: resets today's trade count, lifts any
+        daily-drawdown emergency block, resets the circuit breaker's
+        consecutive-loss counter (the win-rate rolling window is untouched —
+        it isn't session-scoped), and — when `current_balance` is supplied —
+        rolls the DrawdownTracker's own daily/weekly baseline forward too
+        (DrawdownTracker shares this same clock, so it detects the identical
+        crossing and rebases its start-of-day/week balance).
+
+        Call periodically (e.g. every tick) as well as at the top of
+        evaluate_trade() so the reset fires even if nothing else runs.
+
+        Returns True if a boundary crossing was handled this call.
+        """
+        now = self.clock()
+        boundary = session_boundary(now, self.session_reset_hour)
+
+        if self._last_daily_boundary is None:
+            self._last_daily_boundary = boundary
+            return False
+
+        if boundary == self._last_daily_boundary:
+            return False
+
+        self._last_daily_boundary = boundary
+        self.trades_today = 0
+        self.circuit_breaker.reset_consecutive_losses()
+        if current_balance is not None:
+            self.drawdown.update(current_balance)
+        if self._blocked_until_boundary:
+            logger.info(
+                f"Session boundary crossed ({boundary.isoformat()}) — "
+                f"daily drawdown block lifted ({self._block_reason})"
+            )
+        self._blocked_until_boundary = False
+        self._block_reason = ""
+        return True
+
+    def check_drawdown_emergency(
+        self, current_balance: float, current_equity: float = None
+    ) -> bool:
+        """
+        Periodic check (call every tick / loop iteration, independent of
+        whether a new trade is being evaluated): advances the session
+        boundary and checks for a daily-drawdown breach.
+
+        Returns True the moment a daily-drawdown breach is first detected —
+        the caller (Executor) should respond by closing all open positions
+        at market and alerting. Returns False on every subsequent call while
+        still blocked (so callers don't re-trigger close_all repeatedly).
+        """
+        self.check_session_boundary(current_balance)
+
+        equity = current_equity if current_equity is not None else current_balance
+        dd_check = self.drawdown.check(current_balance, equity)
+        daily_violations = [v for v in dd_check["violations"] if "Daily drawdown" in v]
+
+        if daily_violations and not self._blocked_until_boundary:
+            self._blocked_until_boundary = True
+            self._block_reason = "; ".join(daily_violations)
+            logger.critical(
+                f"DAILY DRAWDOWN BREACH: {self._block_reason} — closing all "
+                f"positions, blocking new entries until next session boundary"
+            )
+            return True
+
+        return False
 
     def evaluate_trade(
         self,
@@ -134,6 +234,14 @@ class RiskManager:
         """
         if not self._initialized:
             return TradeApproval(False, "Risk manager not initialized")
+
+        # Check 0: Session boundary / daily-drawdown emergency block
+        self.check_session_boundary(current_balance)
+        if self._blocked_until_boundary:
+            return TradeApproval(
+                False,
+                f"Blocked until next session boundary (daily drawdown): {self._block_reason}",
+            )
 
         equity = current_equity if current_equity is not None else current_balance
         rejections = []
@@ -151,6 +259,14 @@ class RiskManager:
         dd_check = self.drawdown.check(current_balance, equity)
         if not dd_check["allowed"]:
             reasons = "; ".join(dd_check["violations"])
+            daily_violations = [v for v in dd_check["violations"] if "Daily drawdown" in v]
+            if daily_violations and not self._blocked_until_boundary:
+                self._blocked_until_boundary = True
+                self._block_reason = "; ".join(daily_violations)
+                logger.critical(
+                    f"DAILY DRAWDOWN BREACH: {self._block_reason} — closing all "
+                    f"positions, blocking new entries until next session boundary"
+                )
             return TradeApproval(False, f"Drawdown limit: {reasons}")
 
         # Check 4: Spread acceptable
@@ -256,7 +372,16 @@ class RiskManager:
 
     def close_all_signal(self) -> bool:
         """Check if we should close all positions (emergency)."""
-        return self.circuit_breaker.is_shutdown
+        return self.circuit_breaker.is_shutdown or self._blocked_until_boundary
+
+    @property
+    def close_all_reason(self) -> str:
+        """Human-readable reason for the current close_all_signal(), if any."""
+        if self.circuit_breaker.is_shutdown:
+            return f"circuit_breaker_shutdown: {self.circuit_breaker.shutdown_reason}"
+        if self._blocked_until_boundary:
+            return "daily_drawdown"
+        return ""
 
     def force_resume(self):
         """Manual override to resume from pause (not shutdown)."""

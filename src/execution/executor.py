@@ -14,7 +14,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from src.config import Config
 from src.data.mt5_client import MT5Client, MT5Error
@@ -85,10 +85,22 @@ class Executor:
     8. Record result when closed
     """
 
-    def __init__(self, config: Config, client: MT5Client, risk_manager: RiskManager):
+    def __init__(
+        self,
+        config: Config,
+        client: MT5Client,
+        risk_manager: RiskManager,
+        alert_callback: Optional[Callable[[str, dict], None]] = None,
+    ):
         self.config = config
         self.client = client
         self.risk_manager = risk_manager
+
+        # Optional injected alert hook, e.g. wired to the Telegram bot's
+        # send method by main.py. Signature: alert_callback(event, data).
+        # Kept as a plain callback (rather than importing telegram_bot
+        # directly) so this module stays decoupled from the alert channel.
+        self.alert_callback = alert_callback
 
         # Trailing stop config
         self.trailing_enabled = config.get("risk.trailing_stop_enabled", True)
@@ -233,16 +245,37 @@ class Executor:
 
         return open_trade
 
-    def check_and_manage_positions(self, current_prices: dict[str, dict] = None):
+    def check_and_manage_positions(
+        self,
+        current_prices: dict[str, dict] = None,
+        current_balance: float = None,
+        current_equity: float = None,
+    ):
         """
-        Check open positions for trailing stop adjustments.
+        Check open positions for trailing stop adjustments, and — when
+        balance/equity are supplied — for an emergency daily-drawdown
+        close-all.
 
         Call this periodically (e.g., every tick or every minute).
 
         Args:
             current_prices: Optional dict of instrument → {bid, ask} prices.
                            If None, fetches from OANDA.
+            current_balance: Optional realized account balance. When given,
+                           the risk manager's session-boundary + daily
+                           drawdown check runs and can trigger close_all().
+            current_equity: Optional balance + unrealized PnL for the
+                           drawdown check (defaults to current_balance).
         """
+        if current_balance is not None:
+            if self.risk_manager.check_drawdown_emergency(current_balance, current_equity):
+                self.close_all(reason="daily_drawdown")
+
+        if self.risk_manager.close_all_signal():
+            if self.open_trades:
+                self.close_all(reason=self.risk_manager.close_all_reason or "risk_shutdown")
+            return
+
         if not self.open_trades:
             return
 
@@ -381,14 +414,40 @@ class Executor:
         return self._record_closed_trade(trade, exit_reason=reason)
 
     def close_all(self, reason: str = "manual_close_all") -> list[TradeResult]:
-        """Close all open trades. Returns list of results."""
+        """
+        Close every open trade at market via MT5Client, logging each close
+        individually. Used both for manual close-all and for the daily
+        drawdown / circuit-breaker emergency close-all (see
+        check_and_manage_positions and RiskManager.close_all_signal()).
+        Sends one alert summarizing the batch via alert_callback, if wired.
+        """
+        trade_ids = list(self.open_trades.keys())
         results = []
-        for trade_id in list(self.open_trades.keys()):
+        for trade_id in trade_ids:
             result = self.close_trade(trade_id, reason=reason)
             if result:
                 results.append(result)
+                logger.info(
+                    f"Closed {result.instrument} {result.direction} ({result.trade_id}) "
+                    f"| reason: {reason} | PnL: R{result.pnl_zar:.2f} ({result.pnl_pips:.1f} pips)"
+                )
 
-        logger.info(f"Closed all: {len(results)} trades ({reason})")
+        logger.info(f"Closed all: {len(results)}/{len(trade_ids)} trades ({reason})")
+
+        if self.alert_callback:
+            try:
+                self.alert_callback(
+                    "close_all",
+                    {
+                        "reason": reason,
+                        "requested": len(trade_ids),
+                        "closed": len(results),
+                        "results": results,
+                    },
+                )
+            except Exception as e:
+                logger.error(f"close_all alert_callback failed: {e}")
+
         return results
 
     def _record_closed_trade(self, trade: OpenTrade, exit_reason: str) -> TradeResult:

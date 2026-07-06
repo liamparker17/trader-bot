@@ -231,6 +231,16 @@ class CircuitBreaker:
         self.blocked_instruments.clear()
         logger.info("Circuit breaker reset")
 
+    def reset_consecutive_losses(self):
+        """
+        Reset only the consecutive-loss counter. Called by the risk manager
+        at every 21:00 UTC session boundary — unlike reset(), this does NOT
+        touch pause/shutdown state, blocked instruments, or the rolling
+        win-rate window (recent_outcomes), which are not session-scoped.
+        """
+        self.consecutive_losses = 0
+        logger.info("Consecutive-loss counter reset (session boundary)")
+
     def force_resume(self):
         """Force resume from pause state (manual override)."""
         if self.is_shutdown:
