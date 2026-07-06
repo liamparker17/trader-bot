@@ -18,6 +18,7 @@ data/account_state.json
 data/historical/*.parquet
 data/trade_logs/*.db
 data/trade_logs/*.sqlite
+data/traderbot.lock
 
 # ML models (large binary files)
 src/ml/model_store/*.joblib
