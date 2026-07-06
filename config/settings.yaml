@@ -4,9 +4,9 @@
 
 # --- Account ---
 account:
-  starting_balance: 11000
-  currency: "USD"
-  hard_floor: 9000                   # Emergency shutdown if balance drops here
+  starting_balance_zar: 500          # R500 starting demo balance
+  currency: "ZAR"                    # All monetary values throughout the bot are ZAR
+  hard_floor_zar: 9000               # Emergency shutdown if balance drops here (ZAR)
 
 # --- Broker ---
 broker:
@@ -40,7 +40,7 @@ trading:
 
 # --- Risk Management ---
 risk:
-  risk_per_trade_pct: 2.5            # % of balance risked per trade
+  risk_per_trade_pct: 1.5            # Matches CLAUDE.md design baseline
   daily_drawdown_limit_pct: 4.0      # Stop trading if daily loss hits this
   weekly_drawdown_limit_pct: 8.0     # Stop for the week
   max_effective_leverage: 5.0        # Cap effective leverage
@@ -66,6 +66,9 @@ risk:
   # Volatility filters
   high_volatility_atr_ratio: 2.0     # ATR > 2x normal → reduce size 50%
   low_volatility_atr_ratio: 0.3      # ATR < 0.3x normal → skip trading
+
+  # Session boundary — daily resets fire at this UTC hour (NYSE close)
+  session_boundary_hour_utc: 21
 
 # --- Indicators ---
 indicators:

@@ -27,7 +27,7 @@ class ScalingAdvisor:
 
     def __init__(self, config: Config):
         self.config = config
-        self.starting_balance = config.get("account.starting_balance", 500)
+        self.starting_balance = config.get("account.starting_balance_zar", 500)
 
     def get_recommendations(self, balance: float) -> dict:
         """

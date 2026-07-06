@@ -91,8 +91,8 @@ class BacktestSimulator:
         self.predictor = predictor
 
         # Trading params
-        self.starting_balance = config.get("account.starting_balance", 500)
-        self.hard_floor = config.get("account.hard_floor", 350)
+        self.starting_balance = config.get("account.starting_balance_zar", 500)
+        self.hard_floor = config.get("account.hard_floor_zar", 9000)
         self.risk_per_trade = config.get("risk.risk_per_trade_pct", 1.5) / 100
         self.daily_dd_limit = config.get("risk.daily_drawdown_limit_pct", 4.0) / 100
         self.max_trades_day = config.get("trading.max_trades_per_day", 60)

@@ -217,7 +217,7 @@ def run_backtest():
     total_trades = 0
     total_wins = 0
     total_pnl = 0.0
-    starting = config.get("account.starting_balance", 500)
+    starting = config.get("account.starting_balance_zar", 500)
 
     for results in all_results:
         if "error" in results:

@@ -35,7 +35,7 @@ class MilestoneTracker:
         self.milestones: list[float] = sorted(milestones_config)
         self.reached: set[float] = set()
         self.milestone_history: list[dict] = []
-        self.starting_balance = config.get("account.starting_balance", 500)
+        self.starting_balance = config.get("account.starting_balance_zar", 500)
 
     def check(self, current_balance: float):
         """
