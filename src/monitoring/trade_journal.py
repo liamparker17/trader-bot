@@ -97,6 +97,23 @@ class TradeJournal:
                 )
             """)
 
+            # Task 8: control queue (tb CLI) command audit trail. A row is
+            # inserted with outcome='pending' when a command is received,
+            # then updated in place once processed.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS control_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_utc TEXT NOT NULL,
+                    verb TEXT NOT NULL,
+                    args_json TEXT,
+                    reason TEXT,
+                    requested_by TEXT,
+                    before_config_json TEXT,
+                    after_config_json TEXT,
+                    outcome TEXT NOT NULL DEFAULT 'pending'
+                )
+            """)
+
         logger.info(f"Trade journal initialized: {self.db_path}")
 
     def _migrate_fee_columns(self, conn: sqlite3.Connection):
@@ -267,6 +284,79 @@ class TradeJournal:
             query += " WHERE event_type = ?"
             params.append(event_type)
         query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+
+        with sqlite3.connect(self.db_path) as conn:
+            return pd.read_sql_query(query, conn, params=params)
+
+    def log_control_command(
+        self,
+        verb: str,
+        args: dict = None,
+        reason: str = "",
+        requested_by: str = "",
+        ts_utc: str = None,
+    ) -> int:
+        """
+        Record an incoming control-queue (`tb` CLI) command as
+        outcome='pending'. Returns the new row id so the caller can later
+        call `update_control_outcome()` once the command has been processed.
+
+        `ts_utc` lets callers (ControlQueue, which has its own injectable
+        clock for testing) supply the timestamp explicitly; defaults to
+        wall-clock UTC now.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("""
+                INSERT INTO control_log
+                (ts_utc, verb, args_json, reason, requested_by, outcome)
+                VALUES (?, ?, ?, ?, ?, 'pending')
+            """, (
+                ts_utc or datetime.now(timezone.utc).isoformat(),
+                verb,
+                json.dumps(args) if args else None,
+                reason,
+                requested_by,
+            ))
+            return cur.lastrowid
+
+    def update_control_outcome(
+        self,
+        log_id: int,
+        outcome: str,
+        before_config_json: str = None,
+        after_config_json: str = None,
+    ):
+        """Update a control_log row: pending -> applied|rejected|error."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                UPDATE control_log
+                SET outcome = ?,
+                    before_config_json = COALESCE(?, before_config_json),
+                    after_config_json = COALESCE(?, after_config_json)
+                WHERE id = ?
+            """, (outcome, before_config_json, after_config_json, log_id))
+
+    def get_control_log(
+        self,
+        verb: str = None,
+        requested_by: str = None,
+        outcome: str = None,
+        limit: int = 200,
+    ) -> pd.DataFrame:
+        """Query the control_log audit trail, most recent first."""
+        query = "SELECT * FROM control_log WHERE 1=1"
+        params = []
+        if verb:
+            query += " AND verb = ?"
+            params.append(verb)
+        if requested_by:
+            query += " AND requested_by = ?"
+            params.append(requested_by)
+        if outcome:
+            query += " AND outcome = ?"
+            params.append(outcome)
+        query += " ORDER BY id DESC LIMIT ?"
         params.append(limit)
 
         with sqlite3.connect(self.db_path) as conn:
