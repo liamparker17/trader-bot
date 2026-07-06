@@ -590,7 +590,8 @@ class MT5Client:
             if tick is None:
                 raise MT5Error(f"Cannot get fresh price for retry on {symbol}")
 
-            request["price"] = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+            price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+            request["price"] = price
             request["deviation"] = self._compute_deviation(symbol, tick)
 
             result = mt5.order_send(request)
@@ -609,7 +610,9 @@ class MT5Client:
             f"Deal: {result.deal} | Order: {result.order}"
         )
 
-        fill_price, fill_volume = self._validate_fill(symbol, volume, result)
+        fill_price, fill_volume, fill_estimated = self._validate_fill(
+            symbol, volume, result, request_price=price
+        )
 
         # Return in OANDA-compatible format
         return {
@@ -620,6 +623,7 @@ class MT5Client:
                 },
                 "id": str(result.deal),
                 "units": str(fill_volume),
+                "fill_price_estimated": fill_estimated,
             },
         }
 
@@ -649,7 +653,13 @@ class MT5Client:
 
         return max(20, math.ceil(spread_points * 1.5))
 
-    def _validate_fill(self, symbol: str, expected_volume: float, result) -> tuple[float, float]:
+    def _validate_fill(
+        self,
+        symbol: str,
+        expected_volume: float,
+        result,
+        request_price: float,
+    ) -> tuple[float, float, bool]:
         """
         Validate that a DONE order_send result carries sane fill data.
 
@@ -659,7 +669,15 @@ class MT5Client:
         positions for the ticket immediately — rather than waiting on the
         60s reconcile loop — to synthesize/repair the fill data.
 
-        Returns (fill_price, fill_volume) to use in the return payload.
+        If the position poll also can't find the ticket, fall back to the
+        already-known pre-order request price (the tick ask/bid used to
+        build the order request) and the expected order volume — this is
+        an estimate, never a 0.0/negative placeholder, since a garbage
+        price would corrupt downstream trailing-SL and P&L math on a live
+        account. If even that request price is unavailable/invalid, raise
+        loudly rather than return unusable fill data.
+
+        Returns (fill_price, fill_volume, fill_price_estimated).
         """
         price = getattr(result, "price", None)
         volume = getattr(result, "volume", None)
@@ -668,7 +686,7 @@ class MT5Client:
         volume_ok = volume is not None and volume > 0
 
         if price_ok and volume_ok:
-            return price, volume
+            return price, volume, False
 
         logger.warning(
             f"Order result for {symbol} (order={getattr(result, 'order', None)}) missing/"
@@ -691,15 +709,34 @@ class MT5Client:
                 f"Repaired fill for {symbol} ticket {ticket}: "
                 f"price={repaired_price}, volume={repaired_volume}"
             )
-            return repaired_price, repaired_volume
+            return repaired_price, repaired_volume, False
 
-        # Could not repair via position poll — fall back to what we know:
-        # the expected order volume and whatever price we have (or 0.0).
-        logger.error(
+        # Could not repair via position poll — fall back to the known
+        # pre-order request price rather than emitting 0.0/negative,
+        # which would silently corrupt entry_price downstream.
+        fallback_price = price if price_ok else request_price
+        fallback_volume = volume if volume_ok else expected_volume
+
+        if fallback_price is None or fallback_price <= 0:
+            raise MT5Error(
+                f"Cannot determine a sane fill price for {symbol} ticket {ticket}: "
+                f"order result missing price, position poll found no match, and "
+                f"request price is unavailable/invalid ({fallback_price})."
+            )
+        if fallback_volume is None or fallback_volume <= 0:
+            raise MT5Error(
+                f"Cannot determine a sane fill volume for {symbol} ticket {ticket}: "
+                f"order result missing volume, position poll found no match, and "
+                f"expected volume is invalid ({fallback_volume})."
+            )
+
+        logger.warning(
             f"Could not repair fill data for {symbol} ticket {ticket} — "
-            f"position not found. Falling back to expected volume."
+            f"position not found. Falling back to pre-order request price "
+            f"({fallback_price}) and expected volume ({fallback_volume}); "
+            f"marking fill_price_estimated=True."
         )
-        return (price if price_ok else 0.0), (volume if volume_ok else expected_volume)
+        return fallback_price, fallback_volume, True
 
     def close_trade(self, trade_id: str, units: str = "ALL") -> dict:
         """
@@ -724,6 +761,7 @@ class MT5Client:
         close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
         tick = mt5.symbol_info_tick(symbol)
         price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+        deviation = self._compute_deviation(symbol, tick)
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -732,7 +770,7 @@ class MT5Client:
             "type": close_type,
             "position": ticket,
             "price": price,
-            "deviation": 20,
+            "deviation": deviation,
             "magic": 234000,
             "comment": "TraderBot close",
             "type_time": mt5.ORDER_TIME_GTC,

@@ -202,6 +202,13 @@ def test_fill_missing_volume_polls_positions_for_repair(monkeypatch):
 
 
 def test_fill_repair_falls_back_when_position_not_found(monkeypatch):
+    """
+    When both the order result AND the position poll fail to yield a
+    usable price/volume, the fill must fall back to the already-known
+    pre-order request price (the tick ask/bid used to build the order),
+    never to 0.0/negative -- a 0.0 entry_price would corrupt downstream
+    trailing-SL and P&L math on a live account (Task 6 review finding).
+    """
     client = _make_client()
     mock_mt5 = _install_mock_mt5(monkeypatch)
     tick = MagicMock(bid=1.10000, ask=1.10001, time=1735689600)
@@ -211,6 +218,75 @@ def test_fill_repair_falls_back_when_position_not_found(monkeypatch):
     mock_mt5.order_send.return_value = result
     mock_mt5.positions_get.return_value = []
 
-    # Must not raise -- falls back to expected/best-known values.
+    # Must not raise -- falls back to the pre-order request price (BUY -> ask)
+    # and the expected order volume, flagged as estimated.
     response = client.place_market_order("EUR_USD", 10000)
-    assert response["orderFillTransaction"]["price"] == "0.0"
+    fill = response["orderFillTransaction"]
+    assert fill["price"] == "1.10001"
+    assert fill["units"] == "0.1"
+    assert fill["fill_price_estimated"] is True
+
+
+@pytest.mark.parametrize(
+    "result_kwargs",
+    [
+        dict(price=0.0, volume=0.0),
+        dict(price=None, volume=None),
+        dict(price=-1.0, volume=0.10),
+        dict(price=1.10001, volume=-0.10),
+    ],
+)
+def test_fill_repair_never_returns_nonpositive_price_or_volume(monkeypatch, result_kwargs):
+    """No unrepairable-fill code path may surface price<=0 or volume<=0."""
+    client = _make_client()
+    mock_mt5 = _install_mock_mt5(monkeypatch)
+    tick = MagicMock(bid=1.10000, ask=1.10001, time=1735689600)
+    mock_mt5.symbol_info_tick.return_value = tick
+
+    result = MagicMock(retcode=10009, deal=1, order=2, comment="ok", **result_kwargs)
+    mock_mt5.order_send.return_value = result
+    mock_mt5.positions_get.return_value = []
+
+    response = client.place_market_order("EUR_USD", 10000)
+    fill = response["orderFillTransaction"]
+    assert float(fill["price"]) > 0
+    assert float(fill["units"]) > 0
+
+
+def test_fill_repair_raises_when_request_price_unavailable(monkeypatch):
+    """If even the pre-order request price is invalid, hard-fail loudly."""
+    client = _make_client()
+    mock_mt5 = _install_mock_mt5(monkeypatch)
+    tick = MagicMock(bid=0.0, ask=0.0, time=1735689600)
+    mock_mt5.symbol_info_tick.return_value = tick
+
+    result = MagicMock(retcode=10009, price=0.0, volume=0.0, deal=1, order=2, comment="ok")
+    mock_mt5.order_send.return_value = result
+    mock_mt5.positions_get.return_value = []
+
+    with pytest.raises(MT5Error):
+        client.place_market_order("EUR_USD", 10000)
+
+
+# ----------------------------------------------------------------------
+# close_trade uses spread-aware deviation (not hard-coded 20)
+# ----------------------------------------------------------------------
+
+def test_close_trade_uses_computed_deviation(monkeypatch):
+    client = _make_client()
+    mock_mt5 = _install_mock_mt5(monkeypatch)
+
+    position = MagicMock(symbol="EURUSD", type=mock_mt5.ORDER_TYPE_BUY, volume=0.10, ticket=2)
+    mock_mt5.positions_get.return_value = [position]
+
+    # spread = 0.00030 / point(0.00001) = 30 points; 30 * 1.5 = 45
+    tick = MagicMock(bid=1.10000, ask=1.10030, time=1735689600)
+    mock_mt5.symbol_info_tick.return_value = tick
+
+    result = MagicMock(retcode=10009, price=1.10000, comment="ok")
+    mock_mt5.order_send.return_value = result
+
+    client.close_trade("2")
+
+    sent_request = mock_mt5.order_send.call_args[0][0]
+    assert sent_request["deviation"] == 45

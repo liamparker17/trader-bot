@@ -127,3 +127,77 @@ new), run repeatedly while iterating and once more before commit.
   return path would be worse for downstream risk tracking than a
   best-effort record with a placeholder price; this is a judgment call
   worth a second look if reviewed.
+
+## Fix Round 1
+
+Review flagged the `0.0` fallback above as a live-account defect and two
+smaller findings. All three addressed in `src/data/mt5_client.py` plus
+`tests/test_mt5_client_orders.py`.
+
+### 1. (Blocking) `_validate_fill` unrepairable path returned `price=0.0`
+- `_validate_fill()` now takes a new required `request_price` parameter
+  — the pre-order tick price (`tick.ask`/`tick.bid`) already computed in
+  `place_market_order()` before `order_send()`. Return type changed from
+  `tuple[float, float]` to `tuple[float, float, bool]`, the third value
+  being `fill_price_estimated`.
+- When both the order result and the `positions_get(ticket=...)` poll
+  fail to yield a usable price/volume, the method now falls back to
+  `request_price` (never `0.0`/negative) and the caller's
+  `expected_volume`, logs at WARNING with the ticket + reason, and
+  returns `fill_price_estimated=True`.
+- If `request_price` itself is missing/`<= 0` (or the expected volume is
+  `<= 0`), `_validate_fill` now raises `MT5Error` instead of returning
+  garbage — a loud hard-fail rather than a silently corrupted entry
+  price.
+- `place_market_order()` passes `request_price=price` (the same local
+  `price` used to build the order request) into `_validate_fill`, and
+  the returned `fill_price_estimated` flag is added to the response as
+  `orderFillTransaction["fill_price_estimated"]`. `executor.py` was not
+  touched — its `fill.get("price", entry_price)` consumer is unchanged
+  and now always receives a `> 0` price.
+- Bug found and fixed while wiring this up: on the transient-retcode
+  retry path, `request["price"]` was refreshed with a new tick but the
+  local `price` variable used later for `request_price` was not —
+  fixed by reassigning `price` alongside `request["price"]` on retry, so
+  the fallback always reflects the actual last price sent to
+  `order_send()`.
+
+### 2. (Minor) `close_trade()` hard-coded `deviation=20`
+- `close_trade()` now computes `tick = mt5.symbol_info_tick(symbol)` (as
+  before) and calls `self._compute_deviation(symbol, tick)` to build the
+  `deviation` field, matching `place_market_order()`'s spread-aware
+  behavior instead of a fixed `20`.
+
+### 3. Test corrections/additions in `tests/test_mt5_client_orders.py`
+- Rewrote `test_fill_repair_falls_back_when_position_not_found`: no
+  longer asserts `price == "0.0"` (the defect). Now asserts the fill
+  price equals the pre-order request price (`"1.10001"`, the BUY-side
+  tick ask), the volume falls back to the expected order volume
+  (`"0.1"`), and `orderFillTransaction["fill_price_estimated"] is True`.
+- Added `test_fill_repair_never_returns_nonpositive_price_or_volume`,
+  parametrized over four unrepairable scenarios (`price=volume=0.0`,
+  `price=volume=None`, negative price, negative volume) — all assert
+  the final response's price and units are `> 0`.
+- Added `test_fill_repair_raises_when_request_price_unavailable`: tick
+  bid/ask both `0.0` and result/position poll both fail to repair ->
+  `place_market_order()` raises `MT5Error` instead of returning a
+  garbage fill.
+- Added `test_close_trade_uses_computed_deviation`: mocks a wide spread
+  (30 points) and asserts the `order_send` request sent by
+  `close_trade()` carries `deviation == 45` (matching
+  `_compute_deviation`'s formula), not the old hard-coded `20`.
+
+### Test runs
+- `python -m pytest tests/test_mt5_client_orders.py tests/test_mt5_client_symbol_cache.py tests/test_timeutil.py -q`
+  → **34 passed**.
+- `python -m pytest tests/ -x -q` → **109 passed** (103 prior + 6 new:
+  4 parametrized non-positive cases + 1 request-price-unavailable case +
+  1 close_trade deviation case; the rewritten fallback test replaces an
+  existing test rather than adding one).
+
+### Deliberately unchanged
+- `executor.py` — off-limits per brief; its `.get("price", entry_price)`
+  consumer needed no change since it now always receives a sane,
+  positive price.
+- `modify_trade()` — not mentioned in the findings; still untouched,
+  consistent with the original scope decision.
