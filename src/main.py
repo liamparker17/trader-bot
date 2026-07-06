@@ -37,6 +37,8 @@ from src.monitoring.telegram_bot import TelegramBot
 from src.ai.analyst import AIAnalyst
 from src.ai.shadow_trader import ShadowTrader
 from src.ai.approval_queue import ApprovalQueue
+from src.control.effective_config import EffectiveConfig
+from src.control.queue import ControlQueue
 
 logger = logging.getLogger("traderbot")
 
@@ -131,12 +133,18 @@ class TraderBot:
         self.approval_queue = None
         self.instance_lock = InstanceLock()
         self.daily_summary_scheduler = None
+        self.effective_config = None
+        self.control_queue = None
 
         # Main-loop catch-all (item S): rate-limit Telegram alerts to at
         # most one per exception type every N seconds, so a repeatedly
         # failing iteration doesn't spam Telegram.
         self._loop_error_last_alert: dict = {}
         self._loop_error_cooldown_seconds = 300
+
+        # Task 8: consecutive balance/equity refresh failures — escalated
+        # from debug to warning after 3 in a row, reset to 0 on success.
+        self._balance_refresh_failures = 0
 
     def setup(self):
         """Initialize all modules."""
@@ -200,6 +208,28 @@ class TraderBot:
         self.executor = Executor(
             self.config, self.client, self.risk_manager,
             alert_callback=self._on_executor_alert,
+        )
+
+        # EffectiveConfig overlay (Task 8): settings.yaml <+ tunes overlay
+        # <+ safety_floor.yaml (last wins). Read through it at the
+        # whitelisted use sites so a `tb tune` command takes effect on the
+        # next read, no restart required.
+        self.effective_config = EffectiveConfig.load()
+        self.risk_manager.sizer.effective_config = self.effective_config
+        self.predictor.effective_config = self.effective_config
+
+        # Control queue (Task 8): polls control/inbox/*.cmd.json once per
+        # main-loop iteration for pause/resume/tune/revert/status_snapshot
+        # commands from the `tb` CLI (Task 11+).
+        self.control_queue = ControlQueue(
+            config=self.config,
+            journal=self.journal,
+            telegram=self.telegram,
+            risk_manager=self.risk_manager,
+            effective_config=self.effective_config,
+            collector=self.collector,
+            executor=self.executor,
+            client=self.client,
         )
 
         # Load ML model
@@ -298,6 +328,16 @@ class TraderBot:
                     # Actual trading decisions happen in _on_candle_complete callback
                     time.sleep(1)
 
+                    # Control queue (Task 8): process any pending
+                    # pause/resume/tune/revert/status_snapshot commands.
+                    # Wrapped separately so a queue-processing bug can
+                    # never take down the trading loop.
+                    if self.control_queue is not None:
+                        try:
+                            self.control_queue.poll_once()
+                        except Exception as e:
+                            logger.error(f"Control queue poll failed: {e}", exc_info=True)
+
                     # Hourly performance status log
                     now = time.time()
                     if now - last_status_log >= 3600:
@@ -320,42 +360,17 @@ class TraderBot:
                     # account_info on the broker.
                     if now - last_balance_check >= 5:
                         last_balance_check = now
-                        try:
-                            summary = self.client.get_account_summary()
-                            cached_balance = summary["balance"]
-                            cached_equity = summary["equity"]
-                        except Exception as e:
-                            logger.debug(f"Balance/equity refresh failed: {e}")
+                        cached_balance, cached_equity = self._refresh_balance_cache(
+                            cached_balance, cached_equity
+                        )
 
                     # Session boundary (21:00 UTC) reset + daily-drawdown
-                    # emergency check — runs every iteration, independent of
-                    # whether a trade signal fired. Lifts the resumable daily
-                    # block and resets the consecutive-loss counter at the
-                    # boundary; on a fresh daily-drawdown breach, closes all
-                    # positions but keeps the bot RUNNING with entries blocked
-                    # until the next boundary (see RiskManager.entries_blocked).
-                    if cached_balance is not None:
-                        self.risk_manager.check_session_boundary(cached_balance)
-                        if self.risk_manager.check_drawdown_emergency(cached_balance, cached_equity):
-                            logger.critical(
-                                "DAILY DRAWDOWN BREACH — closing all positions; "
-                                "bot stays running, entries blocked until next "
-                                "session boundary"
-                            )
-                            self.executor.close_all("daily_drawdown")
-                            try:
-                                drawdown_pct = self.risk_manager.drawdown.get_daily_drawdown_pct(
-                                    cached_balance
-                                )
-                                self.telegram.daily_stop(cached_balance, drawdown_pct)
-                            except Exception:
-                                pass
-
-                        # Once-per-day Telegram summary at the same 21:00 UTC
-                        # session boundary. Guarded against double-fire (in
-                        # memory + a persisted journal event row) inside the
-                        # scheduler itself.
-                        self._maybe_send_daily_summary(cached_balance)
+                    # emergency check, skipped while broker_down (stale
+                    # cached_balance/cached_equity). See
+                    # _check_session_and_drawdown() docstring for details,
+                    # including its own isolated exception handling.
+                    if cached_balance is not None and not self.collector.broker_down:
+                        self._check_session_and_drawdown(cached_balance, cached_equity)
 
                     # Check for PERMANENT emergency shutdown (hard floor breach /
                     # circuit-breaker shutdown) — distinct from the resumable
@@ -389,6 +404,15 @@ class TraderBot:
             return
 
         if not self.running:
+            return
+
+        # Task 8: skip new-entry evaluation entirely while the broker
+        # connection is down — the health thread hasn't confirmed a fresh
+        # price/account feed, so any signal here would be evaluated
+        # against stale data. Debug-level only: this can fire every
+        # candle during an outage and must not spam the log.
+        if self.collector.broker_down:
+            logger.debug(f"Skipping signal evaluation for {instrument}: broker_down")
             return
 
         try:
@@ -1047,6 +1071,87 @@ class TraderBot:
                 self.journal.record_event("order_failed", msg, data)
         except Exception as e:
             logger.error(f"_on_executor_alert failed: {e}")
+
+    def _refresh_balance_cache(self, cached_balance, cached_equity):
+        """
+        Refresh the cached balance/equity from the broker. On failure,
+        keeps the previous cached values (so callers keep working off the
+        last-known-good numbers) and escalates the log level from debug
+        to warning once 3 consecutive refreshes have failed — a single
+        blip shouldn't page anyone, but a sustained outage should be
+        visible. The counter resets to 0 on the next success.
+
+        Returns (balance, equity) — unchanged from the inputs on failure.
+        """
+        try:
+            summary = self.client.get_account_summary()
+            self._balance_refresh_failures = 0
+            return summary["balance"], summary["equity"]
+        except Exception as e:
+            self._balance_refresh_failures += 1
+            if self._balance_refresh_failures >= 3:
+                logger.warning(
+                    f"Balance/equity refresh failed "
+                    f"{self._balance_refresh_failures}x in a row: {e}"
+                )
+            else:
+                logger.debug(f"Balance/equity refresh failed: {e}")
+            return cached_balance, cached_equity
+
+    def _check_session_and_drawdown(self, cached_balance: float, cached_equity: float):
+        """
+        Session boundary (21:00 UTC) reset + daily-drawdown emergency
+        check — runs every iteration (via the main loop), independent of
+        whether a trade signal fired. Lifts the resumable daily block and
+        resets the consecutive-loss counter at the boundary; on a fresh
+        daily-drawdown breach, closes all positions but keeps the bot
+        RUNNING with entries blocked until the next boundary (see
+        RiskManager.entries_blocked). Also fires the once-per-day Telegram
+        summary at the same boundary.
+
+        Callers should skip calling this entirely while broker_down is
+        True (cached_balance/cached_equity would be stale) — see run().
+
+        This method has its OWN try/except, distinct from the generic
+        per-iteration catch-all (_handle_loop_exception): an exception
+        here specifically engages RiskManager's manual pause (blocking
+        new entries until a `resume` command or code fix + restart) and
+        sends a dedicated Telegram alert, rather than just being logged
+        and rate-limited like any other loop exception.
+        """
+        try:
+            self.risk_manager.check_session_boundary(cached_balance)
+            if self.risk_manager.check_drawdown_emergency(cached_balance, cached_equity):
+                logger.critical(
+                    "DAILY DRAWDOWN BREACH — closing all positions; "
+                    "bot stays running, entries blocked until next "
+                    "session boundary"
+                )
+                self.executor.close_all("daily_drawdown")
+                try:
+                    drawdown_pct = self.risk_manager.drawdown.get_daily_drawdown_pct(
+                        cached_balance
+                    )
+                    self.telegram.daily_stop(cached_balance, drawdown_pct)
+                except Exception:
+                    pass
+
+            self._maybe_send_daily_summary(cached_balance)
+        except Exception as e:
+            logger.error(
+                f"Session boundary / drawdown emergency check failed — "
+                f"pausing new entries: {e}",
+                exc_info=True,
+            )
+            self.risk_manager.set_manual_pause(
+                f"session boundary/drawdown check exception: {e}"
+            )
+            try:
+                self.telegram._send(
+                    f"<b>Session/drawdown check failed</b> — new entries paused: {e}"
+                )
+            except Exception:
+                pass
 
     def _maybe_send_daily_summary(self, balance: float):
         """
