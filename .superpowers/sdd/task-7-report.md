@@ -23,6 +23,70 @@ explicitly skipped. Did not touch main.py, telegram_bot.py, executor.py, or mt5_
   which naturally reduces the gross result for the common case and would only
   increase it for the rare positive-swap (carry) case.
 
+## Fix Round 1
+
+**Review finding:** `evaluator_state` only persisted the scalar retrain counters
+(`trades_since_retrain`, `last_retrain_time`, `model_version`). The `self.trades`
+deque (maxlen=5000) that powers the win-rate degradation branch of
+`should_retrain()` was never persisted — after a restart it started empty, so the
+win-rate trigger was silently disabled until `win_rate_lookback` (default 100) new
+trades had accumulated in memory again. Brief item (K) requires retrain triggers
+to survive process death; this branch didn't.
+
+**Change summary (`src/ml/evaluator.py` only, + tests):**
+- New `evaluator_trades` table (`CREATE TABLE IF NOT EXISTS`, idempotent, created
+  in `_init_state_table()` alongside `evaluator_state`): columns `id` (autoincrement),
+  `prediction`, `predicted_action`, `actual_outcome`, `pnl`, `timestamp` — the exact
+  fields `TradeRecord` needs to be reconstructed.
+- `record_trade()` now calls `self.save_state(new_trade=trade)` instead of
+  `save_state()`.
+- `save_state(new_trade=None)`: within the **same** `sqlite3.connect()`
+  block/transaction as the existing `evaluator_state` upsert, if `new_trade` is
+  given it inserts the row into `evaluator_trades`, then prunes to
+  `max(win_rate_lookback, 500)` most-recent rows (`DELETE ... WHERE id NOT IN
+  (SELECT id ... ORDER BY id DESC LIMIT ?)`). `should_retrain()`'s win-rate branch
+  only ever reads the last `win_rate_lookback` trades, so there's no need to
+  persist the full 5000-deep in-memory deque — this avoids unbounded DB growth
+  while keeping identical trigger behavior. `mark_retrained()`'s existing
+  `save_state()` call (no `new_trade`) is unaffected.
+- `load_state()`: in addition to the existing scalar-counter load, now also
+  `SELECT`s all rows from `evaluator_trades` ordered `id ASC` (oldest → newest)
+  and rebuilds `self.trades` as a `deque(..., maxlen=self.trades.maxlen)` from
+  them, so `should_retrain()` sees the identical window pre/post restart.
+- Both reads (`evaluator_state` row + `evaluator_trades` rows) happen inside one
+  `sqlite3.connect()` block in `load_state()`, matching the "one connection per
+  call" constraint.
+- Deliberately unchanged: `_init_state_table()`'s idempotency guarantee, the
+  `evaluator_state` schema/upsert, `main.py`'s existing `self.evaluator.load_state()`
+  call site (untouched, out of scope), and the 5000-deep in-memory deque size
+  (only the *persisted* window is capped, not the live `self.trades`).
+
+**Tests added** (`tests/test_evaluator_persistence.py`):
+- `test_win_rate_trigger_survives_restart`: seeds `win_rate_lookback` (100)
+  losing trades on one `Evaluator` (confirms `should_retrain()` trips with a
+  "Win rate trigger" reason), then constructs a **fresh** `Evaluator` against the
+  same tmp-path SQLite DB. Confirms the trigger is *not* active before
+  `load_state()` (nothing in memory yet) and *is* active immediately after
+  `load_state()` — proving the window round-trips and the branch behaves
+  identically across a simulated restart. Real sqlite, tz-aware UTC via
+  `TradeRecord`'s default timestamp, no mocks.
+- `test_win_rate_trigger_control_fresh_db_does_not_trip`: control case — a brand
+  new DB with nothing persisted must not spuriously trip the trigger after
+  `load_state()`.
+
+**Test command + output:**
+```
+python -m pytest tests/test_evaluator_persistence.py tests/test_journal_fees.py -q
+...............
+15 passed in 1.12s
+
+python -m pytest tests/ -x -q
+........................................................................ [ 80%]
+..................                                                       [100%]
+90 passed in 1.64s
+```
+(88 pre-existing + 2 new = 90, all green.)
+
 ## (K) `src/ml/evaluator.py`
 - Evaluator's `save_state()`/`load_state()` used to persist to a private
   `data/trade_logs/evaluator_state.json` file. Replaced with a dedicated

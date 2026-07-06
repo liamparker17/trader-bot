@@ -95,3 +95,47 @@ def test_save_state_upserts_not_duplicates(tmp_path):
     with sqlite3.connect(tmp_path / "trades.db") as conn:
         rows = conn.execute("SELECT COUNT(*) FROM evaluator_state").fetchone()
     assert rows[0] == 1
+
+
+def test_win_rate_trigger_survives_restart(tmp_path):
+    """
+    Task 7 review finding: the win-rate degradation trigger reads
+    self.trades, which lived only in memory. Seed enough losing trades to
+    trip should_retrain()'s win-rate branch, restart (fresh Evaluator on the
+    same DB via load_state()), and confirm the trigger still fires.
+    """
+    config = _config(tmp_path)
+    ev = Evaluator(config)
+    assert ev.win_rate_lookback == 100
+    assert ev.min_win_rate == 0.45
+
+    # All losses -> recent win rate 0% < 45% threshold, well past lookback.
+    for _ in range(ev.win_rate_lookback):
+        ev.record_trade(TradeRecord(
+            prediction=0.4, predicted_action="trade", actual_outcome=0, pnl=-5.0,
+        ))
+
+    should, reason = ev.should_retrain()
+    assert should is True
+    assert "Win rate trigger" in reason
+
+    # Simulate restart: brand-new Evaluator, only load_state() restores memory.
+    ev2 = Evaluator(config)
+    should2, reason2 = ev2.should_retrain()
+    assert should2 is False  # nothing loaded yet -> trigger not active
+
+    ev2.load_state()
+    should3, reason3 = ev2.should_retrain()
+    assert should3 is True
+    assert "Win rate trigger" in reason3
+
+
+def test_win_rate_trigger_control_fresh_db_does_not_trip(tmp_path):
+    """Control case: a fresh DB with no persisted trades must not trip the
+    win-rate trigger after load_state()."""
+    config = _config(tmp_path)
+    ev = Evaluator(config)
+    ev.load_state()
+    should, reason = ev.should_retrain()
+    assert should is False
+    assert reason == "No retrain needed"

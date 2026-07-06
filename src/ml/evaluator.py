@@ -88,7 +88,8 @@ class Evaluator:
         self._init_state_table()
 
     def _init_state_table(self):
-        """Create the evaluator_state table if it doesn't exist (idempotent)."""
+        """Create the evaluator_state / evaluator_trades tables if they
+        don't exist (idempotent)."""
         with sqlite3.connect(self._db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS evaluator_state (
@@ -99,12 +100,26 @@ class Evaluator:
                     updated_at TEXT
                 )
             """)
+            # Persists the sliding window that `should_retrain()`'s win-rate
+            # trigger reads (last `win_rate_lookback` trades). Without this,
+            # the win-rate trigger is silently disabled after a restart until
+            # enough new trades accumulate in memory (Task 7 review finding).
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS evaluator_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    prediction REAL NOT NULL,
+                    predicted_action TEXT,
+                    actual_outcome INTEGER NOT NULL,
+                    pnl REAL NOT NULL,
+                    timestamp TEXT
+                )
+            """)
 
     def record_trade(self, trade: TradeRecord):
         """Record a completed trade for evaluation."""
         self.trades.append(trade)
         self.trades_since_retrain += 1
-        self.save_state()
+        self.save_state(new_trade=trade)
 
     def record_from_dict(self, trade_data: dict):
         """Record a trade from a dictionary (convenience method)."""
@@ -278,12 +293,13 @@ class Evaluator:
         lines.append("=" * 50)
         return "\n".join(lines)
 
-    def save_state(self):
+    def save_state(self, new_trade: Optional[TradeRecord] = None):
         """
         Persist retrain-trigger counters to the `evaluator_state` table
-        (single row, id=1) so they survive a bot restart. Called
-        automatically on every `record_trade` / `mark_retrained`, and can
-        also be called explicitly (e.g. on startup/shutdown).
+        (single row, id=1), and optionally append `new_trade` to the
+        `evaluator_trades` window table, in a single connection/transaction.
+        Called automatically on every `record_trade` / `mark_retrained`, and
+        can also be called explicitly (e.g. on startup/shutdown).
         """
         with sqlite3.connect(self._db_path) as conn:
             conn.execute("""
@@ -302,18 +318,68 @@ class Evaluator:
                 datetime.now(timezone.utc).isoformat(),
             ))
 
+            if new_trade is not None:
+                conn.execute("""
+                    INSERT INTO evaluator_trades
+                        (prediction, predicted_action, actual_outcome, pnl, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    new_trade.prediction,
+                    new_trade.predicted_action,
+                    new_trade.actual_outcome,
+                    new_trade.pnl,
+                    new_trade.timestamp,
+                ))
+                # Prune to the window should_retrain()'s win-rate trigger
+                # actually reads (last win_rate_lookback trades), with a
+                # small margin — no need to keep the full 5000-deep history.
+                cap = max(self.win_rate_lookback, 500)
+                conn.execute("""
+                    DELETE FROM evaluator_trades
+                    WHERE id NOT IN (
+                        SELECT id FROM evaluator_trades ORDER BY id DESC LIMIT ?
+                    )
+                """, (cap,))
+
+            conn.commit()
+
     def load_state(self):
-        """Load persisted evaluator state from the journal DB, if present."""
+        """
+        Load persisted evaluator state from the journal DB, if present, and
+        rebuild the `self.trades` window (oldest -> newest) from the
+        `evaluator_trades` table so `should_retrain()`'s win-rate trigger
+        behaves identically before and after a restart.
+        """
         with sqlite3.connect(self._db_path) as conn:
             row = conn.execute("""
                 SELECT trades_since_retrain, last_retrain_time, model_version
                 FROM evaluator_state WHERE id = 1
             """).fetchone()
-        if row is None:
-            return
-        self.trades_since_retrain = row[0] or 0
-        self.last_retrain_time = datetime.fromisoformat(row[1]) if row[1] else None
-        self.model_version = row[2]
+
+            trade_rows = conn.execute("""
+                SELECT prediction, predicted_action, actual_outcome, pnl, timestamp
+                FROM evaluator_trades ORDER BY id ASC
+            """).fetchall()
+
+        if row is not None:
+            self.trades_since_retrain = row[0] or 0
+            self.last_retrain_time = datetime.fromisoformat(row[1]) if row[1] else None
+            self.model_version = row[2]
+
+        if trade_rows:
+            self.trades = deque(
+                (
+                    TradeRecord(
+                        prediction=r[0],
+                        predicted_action=r[1],
+                        actual_outcome=r[2],
+                        pnl=r[3],
+                        timestamp=r[4],
+                    )
+                    for r in trade_rows
+                ),
+                maxlen=self.trades.maxlen,
+            )
 
     def _calculate_calibration(self, trades: list[TradeRecord]) -> dict:
         """
