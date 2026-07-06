@@ -156,3 +156,105 @@ tracked tests exist to regress.)
    interval (5s) is currently a hardcoded collector attribute
    (`_health_check_interval_seconds`), not config-driven. Flagging in case
    the team wants it tunable.
+
+## Fix Round 1
+
+Fixes for the 5 review findings, applied on top of commit `bb1e901`.
+
+### Finding 1 — interruptible backoff (Important)
+- `MT5Client.__init__`: added `self._stream_cancelled = False`.
+- New `MT5Client.cancel_stream()`: sets `self._stream_cancelled = True`. Safe
+  to call anytime, including when no stream is running.
+- New `MT5Client._interruptible_sleep(total_seconds, chunk=0.1)`: sleeps in
+  `chunk`-sized steps (mirrors `DataCollector._health_loop`'s existing
+  0.1s-chunked pattern), rechecking `self._stream_cancelled` between steps
+  so a multi-second backoff sleep can be cut short almost immediately.
+- `stream_prices()`: loop condition changed from `while True` to
+  `while not self._stream_cancelled`; both the backoff sleep and the normal
+  0.1s poll sleep now go through `_interruptible_sleep()` instead of raw
+  `time.sleep()`. `self._stream_cancelled` is reset to `False` at the start
+  of every `stream_prices()` call.
+- `DataCollector.stop_streaming()`: now calls `self.client.cancel_stream()`
+  in addition to flipping `self._streaming = False`, so an in-progress
+  backoff sleep is interrupted right away instead of being waited out.
+- Tests added: `test_interruptible_sleep_stops_promptly_on_cancel` (direct,
+  no real sleeping — fake `time.sleep` cancels after 2 chunks, asserts only
+  2 chunks ran and `sum(sleep_calls) < 1.0` even though a full 60s sleep was
+  requested) and `test_stream_prices_backoff_is_interruptible_via_cancel_stream`
+  (same assertion driven through the actual generator, expects `StopIteration`
+  once cancelled).
+- Existing backoff tests (`test_stream_prices_backs_off_exponentially_on_disconnect`,
+  `..._backoff_capped_at_60s`, `..._resets_backoff_on_success`) were updated to
+  monkeypatch the new `client._interruptible_sleep` seam instead of raw
+  `time.sleep`, so they keep asserting the exact backoff progression
+  (1.0, 2.0, 4.0, 8.0, ... capped at 60.0) without being coupled to the 0.1s
+  chunk size.
+
+### Finding 2 — flap debounce (Medium)
+- Mechanism chosen: **require 2 consecutive agreeing health checks** before
+  flipping `broker_down` in either direction (not the 60s-min-interval
+  alternative) — simpler, deterministic, and easy to unit test without fake
+  clocks.
+- `DataCollector.__init__`: added `self._flap_debounce_count = 2`,
+  `self._consecutive_failures = 0`, `self._consecutive_successes = 0`.
+- `check_connection()`: increments/resets the two counters every call, and
+  only flips `broker_down` (± firing the Telegram alert / resync) once the
+  relevant counter reaches `_flap_debounce_count`. Documented in the
+  docstring.
+- Tests updated: `test_check_connection_detects_disconnect_and_pauses_entries`
+  and `test_check_connection_never_raises_on_client_exception` /
+  `..._never_raises_when_telegram_fails` now call `check_connection()` twice
+  and assert no flip/alert after the first (flaky) call.
+  `test_check_connection_recovery_resyncs_symbols_and_resumes` now drives 2
+  failures to go down and 2 successes to come back up, asserting the
+  alert/resync only fires on the 2nd success.
+  New test `test_check_connection_single_flaky_failure_does_not_flip_or_alert`
+  covers a single bad check followed by a good one never flipping
+  `broker_down` or firing any alert.
+
+### Finding 3 — probe-on-error only (Low)
+- `stream_prices()`: `self.is_broker_connected()` is no longer called
+  unconditionally every iteration. It's now called only inside the
+  `if loop_had_error:` branch, purely as a diagnostic log line — it can no
+  longer independently set `loop_had_error` when the tick loop itself
+  didn't error.
+- Test mocks reworked: `_setup_stream_mocks()` now simulates a real
+  disconnect as `symbol_info_tick` raising an exception (the actual signal
+  that drives `loop_had_error`) rather than relying on the probe returning
+  `False` while ticks silently return `None`.
+- New test `test_stream_prices_ignores_probe_blip_when_ticks_healthy`:
+  ticks never error but `is_broker_connected()` reports `False` throughout —
+  asserts the poll stays at the normal 0.1s interval with no backoff growth.
+
+### Finding 4 — single-writer docstring (Low)
+- `DataCollector.check_connection()` docstring now has an explicit
+  "IMPORTANT — single-writer" paragraph stating it mutates `broker_down` and
+  the new debounce counters without a lock and must only ever be called
+  from the health-check thread (`_health_loop`).
+
+### Finding 5 — thread lifecycle test (Gap)
+- New test `test_start_stop_streaming_lifecycle` in
+  `tests/test_collector_connection.py`: mocks `client.stream_prices` with a
+  fast fake generator (no real network/backoff), starts streaming, asserts
+  both threads are alive/daemon, asserts a second `start_streaming()` call
+  is a no-op (guarded, same thread objects), then calls `stop_streaming()`
+  and asserts `client.cancel_stream()` was called once and both threads
+  join within 2s (real-time join, since the mocked stream has no backoff to
+  wait out).
+
+### Test run
+```
+python -m pytest tests/test_mt5_client_connection.py tests/test_collector_connection.py tests/test_telegram_mt5_alerts.py -q
+```
+→ `26 passed in 1.11s`
+
+Full suite (`python -m pytest -q` from the worktree root — this worktree's
+`tests/` directory only contains the Task 3 files above, so it's the same
+26 tests): `26 passed in 0.80s`.
+
+### Deliberately not changed
+- Did not implement the "min 60s between alerts" debounce alternative —
+  picked consecutive-check debounce instead (see Finding 2 above).
+- Did not touch `main.py` wiring, Task 6's symbol-suffix TODO, or the
+  health-check-interval config-driven suggestion — all out of scope for
+  this review round.

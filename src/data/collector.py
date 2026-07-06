@@ -63,6 +63,14 @@ class DataCollector:
         self.broker_down = False
         self._health_check_interval_seconds = 5
 
+        # Flap debounce: require this many CONSECUTIVE agreeing health
+        # checks before flipping `broker_down` (and firing its alert) in
+        # either direction. Guards against a flapping connection firing
+        # disconnected/reconnected alerts back-to-back on single blips.
+        self._flap_debounce_count = 2
+        self._consecutive_failures = 0
+        self._consecutive_successes = 0
+
     def load_historical_data(self, granularity: str = "M1") -> dict[str, pd.DataFrame]:
         """
         Fetch and cache historical data for all enabled instruments.
@@ -127,6 +135,10 @@ class DataCollector:
     def stop_streaming(self):
         """Stop the price stream."""
         self._streaming = False
+        # Interrupt an in-progress stream_prices() generator immediately,
+        # including mid-backoff-sleep, instead of waiting out its chunked
+        # sleep loop naturally (see MT5Client.cancel_stream()).
+        self.client.cancel_stream()
         if self._stream_thread and self._stream_thread.is_alive():
             logger.info("Stopping price stream...")
             # The stream loop will exit on next iteration when _streaming is False
@@ -148,6 +160,15 @@ class DataCollector:
         symbol suffix mapping, sets `self.broker_down = False`, and fires
         the `mt5.reconnected` Telegram alert.
 
+        Flap debounce: a state flip only fires after `_flap_debounce_count`
+        (2) CONSECUTIVE checks agree in that direction, so a single flaky
+        probe result can't flap `broker_down`/alerts back and forth.
+
+        IMPORTANT — single-writer: this method mutates `broker_down` and the
+        consecutive-failure/success counters without a lock. It must only
+        ever be called from the health-check thread (`_health_loop`); calling
+        it concurrently from another thread is not safe.
+
         Returns the current connected state. Never raises.
         """
         try:
@@ -156,7 +177,18 @@ class DataCollector:
             logger.warning(f"Broker connectivity check failed: {e}")
             connected = False
 
-        if not connected and not self.broker_down:
+        if connected:
+            self._consecutive_successes += 1
+            self._consecutive_failures = 0
+        else:
+            self._consecutive_failures += 1
+            self._consecutive_successes = 0
+
+        if (
+            not connected
+            and not self.broker_down
+            and self._consecutive_failures >= self._flap_debounce_count
+        ):
             self.broker_down = True
             logger.critical(
                 "MT5 broker connection lost. Pausing new-entry signals."
@@ -167,7 +199,11 @@ class DataCollector:
                 except Exception as e:
                     logger.warning(f"Telegram disconnect alert failed: {e}")
 
-        elif connected and self.broker_down:
+        elif (
+            connected
+            and self.broker_down
+            and self._consecutive_successes >= self._flap_debounce_count
+        ):
             self._resync_symbols()
             self.broker_down = False
             logger.info("MT5 broker connection restored. Resuming.")

@@ -70,6 +70,13 @@ class MT5Client:
         self.password = config.mt5_password or ""
         self.server = config.mt5_server or ""
 
+        # Set by cancel_stream() to promptly interrupt an in-progress
+        # stream_prices() generator (including mid-backoff-sleep), instead
+        # of leaving DataCollector.stop_streaming() to wait out a sleep of
+        # up to `max_backoff` seconds. Reset at the start of every
+        # stream_prices() call.
+        self._stream_cancelled = False
+
     # ------------------------------------------------------------------
     # Connection management
     # ------------------------------------------------------------------
@@ -148,6 +155,30 @@ class MT5Client:
         except Exception as e:
             logger.warning(f"is_broker_connected() check failed: {e}")
             return False
+
+    def cancel_stream(self):
+        """
+        Request that an in-progress stream_prices() generator exit promptly.
+
+        Checked between chunked sleep steps (see `_interruptible_sleep`), so
+        calling this during a multi-second backoff sleep interrupts it
+        within one chunk (~0.1s) instead of blocking until the sleep
+        completes. Safe to call even if no stream is running.
+        """
+        self._stream_cancelled = True
+
+    def _interruptible_sleep(self, total_seconds: float, chunk: float = 0.1) -> None:
+        """
+        Sleep for `total_seconds`, checking `self._stream_cancelled` every
+        `chunk` seconds so a long backoff sleep in stream_prices() can be
+        cut short by cancel_stream() instead of blocking for the full
+        duration (up to `max_backoff`).
+        """
+        remaining = total_seconds
+        while remaining > 0 and not self._stream_cancelled:
+            step = min(chunk, remaining)
+            time.sleep(step)
+            remaining -= step
 
     # ------------------------------------------------------------------
     # Account
@@ -399,8 +430,9 @@ class MT5Client:
         consecutive_errors = 0
         base_backoff = 1.0
         max_backoff = 60.0
+        self._stream_cancelled = False
 
-        while True:
+        while not self._stream_cancelled:
             loop_had_error = False
 
             for sym in symbols:
@@ -431,13 +463,17 @@ class MT5Client:
                     logger.warning(f"Tick error for {sym}: {e}")
                     loop_had_error = True
 
-            # Cheap health probe: if the broker connection itself is down,
-            # treat this iteration as an error too so we back off instead
-            # of spamming symbol_info_tick() every 100ms.
-            if not self.is_broker_connected():
-                loop_had_error = True
-
             if loop_had_error:
+                # Probe as diagnosis, not as gate: only consult
+                # is_broker_connected() once we already know this iteration
+                # errored, to log a clearer signal. A transient probe blip
+                # must NOT by itself force backoff while ticks are otherwise
+                # flowing fine — that was a self-inflicted throttle.
+                if not self.is_broker_connected():
+                    logger.warning(
+                        "Broker connectivity probe confirms disconnect during stream error"
+                    )
+
                 consecutive_errors += 1
                 raw_delay = base_backoff * (2 ** (consecutive_errors - 1))
                 capped_delay = min(raw_delay, max_backoff)
@@ -447,11 +483,13 @@ class MT5Client:
                     f"MT5 stream degraded (consecutive errors={consecutive_errors}); "
                     f"backing off {sleep_time:.1f}s"
                 )
-                time.sleep(sleep_time)
+                self._interruptible_sleep(sleep_time)
             else:
                 consecutive_errors = 0
                 # Poll interval — ~100ms for responsive candle building
-                time.sleep(0.1)
+                self._interruptible_sleep(0.1)
+
+        logger.info("Price stream cancelled")
 
     # ------------------------------------------------------------------
     # Orders
