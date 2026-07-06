@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from src.config import Config
+from src.risk.ratchet_floor import RatchetFloor
 
 logger = logging.getLogger("traderbot.risk.breaker")
 
@@ -33,7 +34,7 @@ class CircuitBreaker:
     6. Daily/weekly drawdown → handled by DrawdownTracker
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, ratchet_floor: Optional[RatchetFloor] = None):
         self.config = config
 
         # Thresholds from config
@@ -42,8 +43,17 @@ class CircuitBreaker:
         self.pause_duration_min = config.get("risk.pause_duration_minutes", 30)
         self.min_win_rate = config.get("risk.min_win_rate_threshold", 0.45)
         self.win_rate_lookback = config.get("risk.min_win_rate_lookback", 100)
-        self.hard_floor = config.get("account.hard_floor_zar", 350)
         self.max_spread_mult = config.get("risk.max_spread_multiplier", 2.0)
+
+        # Ratcheting hard floor (replaces the old fixed hard_floor_zar kill
+        # switch). Injected by callers that own the shared account state
+        # (see src/risk/manager.py); falls back to a self-constructed
+        # instance using the safety_floor.yaml defaults so this class still
+        # works standalone (e.g. in tests).
+        self.ratchet_floor = ratchet_floor or RatchetFloor(
+            min_floor_zar=config.get("risk.min_floor_zar", 600),
+            max_total_drawdown_pct=config.get("risk.max_total_drawdown_pct", 0.35),
+        )
 
         # State
         self.consecutive_losses: int = 0
@@ -126,10 +136,11 @@ class CircuitBreaker:
         return True
 
     def check_balance(self, balance: float) -> bool:
-        """Check if balance is above hard floor. Returns True if OK."""
-        if balance <= self.hard_floor:
+        """Check if balance is above the ratcheting hard floor. Returns True if OK."""
+        floor = self.ratchet_floor.update(balance)
+        if self.ratchet_floor.is_breached(balance):
             self._shutdown(
-                f"HARD FLOOR BREACH: Balance R{balance:.2f} <= R{self.hard_floor}"
+                f"HARD FLOOR BREACH: Balance R{balance:.2f} <= R{floor:.2f}"
             )
             return False
         return True

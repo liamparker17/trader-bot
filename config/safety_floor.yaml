@@ -6,7 +6,8 @@
 # ============================================================
 risk:
   daily_drawdown_stop_pct: 4.0        # Hard stop the day at -4%
-  hard_floor_zar: 9000                # Kill switch if equity drops here (ZAR)
+  min_floor_zar: 600                  # Ratchet floor never goes below this (ZAR)
+  max_total_drawdown_pct: 0.35        # Floor = high-water-mark * (1 - this), clamped to min_floor_zar
   max_leverage_effective: 5.0         # Cap effective leverage
 circuit_breaker:
   api_error_threshold: 10             # Pause if more than N API errors in 10 min

@@ -14,6 +14,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from src.config import Config
+from src.risk.ratchet_floor import RatchetFloor
 
 logger = logging.getLogger("traderbot.risk.drawdown")
 
@@ -26,11 +27,19 @@ class DrawdownTracker:
     to decide whether to pause trading.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, ratchet_floor: Optional[RatchetFloor] = None):
         self.config = config
         self.daily_limit = config.get("risk.daily_drawdown_limit_pct", 4.0) / 100
         self.weekly_limit = config.get("risk.weekly_drawdown_limit_pct", 8.0) / 100
-        self.hard_floor = config.get("account.hard_floor_zar", 350)
+
+        # Ratcheting hard floor (replaces the old fixed hard_floor_zar).
+        # Same injection pattern as CircuitBreaker — share one RatchetFloor
+        # instance across both when wired up by the risk manager so the
+        # high-water mark stays consistent.
+        self.ratchet_floor = ratchet_floor or RatchetFloor(
+            min_floor_zar=config.get("risk.min_floor_zar", 600),
+            max_total_drawdown_pct=config.get("risk.max_total_drawdown_pct", 0.35),
+        )
 
         # State
         self.high_water_mark: float = 0.0
@@ -127,10 +136,11 @@ class DrawdownTracker:
         if self.high_water_mark > 0:
             total_dd = (self.high_water_mark - equity) / self.high_water_mark
 
-        # Hard floor
-        if current_balance <= self.hard_floor:
+        # Hard floor (ratcheting)
+        floor = self.ratchet_floor.update(current_balance)
+        if self.ratchet_floor.is_breached(current_balance):
             violations.append(
-                f"Balance R{current_balance:.2f} <= hard floor R{self.hard_floor}"
+                f"Balance R{current_balance:.2f} <= hard floor R{floor:.2f}"
             )
 
         return {

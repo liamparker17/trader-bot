@@ -4,9 +4,11 @@
 
 # --- Account ---
 account:
-  starting_balance_zar: 500          # R500 starting demo balance
+  starting_balance_zar: 1000         # R1000 starting live balance
   currency: "ZAR"                    # All monetary values throughout the bot are ZAR
-  hard_floor_zar: 9000               # Emergency shutdown if balance drops here (ZAR)
+  # NOTE: the fixed hard_floor_zar kill switch has been replaced by the
+  # ratcheting floor in config/safety_floor.yaml (risk.min_floor_zar /
+  # risk.max_total_drawdown_pct), enforced via src/risk/ratchet_floor.py.
 
 # --- Broker ---
 broker:
@@ -133,7 +135,7 @@ growth:
   target_balance: 6000
   reinvest_pct_growth_phase: 100     # 100% reinvest until target
   reinvest_pct_harvest_phase: 50     # 50% reinvest after target
-  milestones: [750, 1000, 2000, 3000, 6000]
+  milestones: [1500, 2000, 3000, 4500, 6000]
 
 # --- Monitoring ---
 monitoring:

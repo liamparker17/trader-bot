@@ -12,6 +12,7 @@ __pycache__/
 # Control plane runtime files (created on the VPS at runtime)
 data/control/
 data/traderbot.lock
+data/account_state.json
 
 # Data files (too large for git)
 data/historical/*.parquet

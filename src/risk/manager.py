@@ -17,6 +17,7 @@ from src.config import Config
 from src.risk.position_sizer import PositionSizer
 from src.risk.drawdown_tracker import DrawdownTracker
 from src.risk.circuit_breaker import CircuitBreaker
+from src.risk.ratchet_floor import RatchetFloor
 
 logger = logging.getLogger("traderbot.risk")
 
@@ -92,8 +93,16 @@ class RiskManager:
     def __init__(self, config: Config):
         self.config = config
         self.sizer = PositionSizer(config)
-        self.drawdown = DrawdownTracker(config)
-        self.circuit_breaker = CircuitBreaker(config)
+
+        # One shared ratchet floor so the high-water mark used by the
+        # drawdown tracker's hard-floor check and the circuit breaker's
+        # kill switch always agree.
+        self.ratchet_floor = RatchetFloor(
+            min_floor_zar=config.get("risk.min_floor_zar", 600),
+            max_total_drawdown_pct=config.get("risk.max_total_drawdown_pct", 0.35),
+        )
+        self.drawdown = DrawdownTracker(config, ratchet_floor=self.ratchet_floor)
+        self.circuit_breaker = CircuitBreaker(config, ratchet_floor=self.ratchet_floor)
 
         self.max_open_positions = config.get("risk.max_open_positions", 3)
         self.max_trades_per_day = config.get("trading.max_trades_per_day", 60)
