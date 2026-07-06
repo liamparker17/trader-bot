@@ -179,3 +179,12 @@
 - Order: 1 → 2..7 (hardening; 2-7 independent of each other after 1) → 8 → 9,10 (need 8) → 11 (needs 8) → 12 → 13 (needs 12) → 14 (needs 13's manager_log) → 15 (needs 12) → 16 (needs 15) → 17.
 - `pip install anthropic` + add to requirements in Task 13.
 - Each task: TDD, commit(s) on `feat/claude-manager-live-r1000`, run full suite.
+
+### Task 18 — Prompt lab: Ralph loop for manager-prompt optimization
+**Files:** new `backtest/prompt_lab.py`, `src/manager/prompts/` (versioned prompt files, `champion.md` symlink-equivalent via `champion.txt` containing filename), `src/manager/client.py` (load system prompt from champion file), tests
+1. Prompt variants live as files `src/manager/prompts/v001.md`, `v002.md`… Client loads the one named in `champion.txt` (fallback: highest version).
+2. `python -m backtest.prompt_lab --variants v001,v002 --window <days>`: for each variant, run the managed backtest (`--manager=claude`) over the same window/seed, score = net-after-cost P&L with a max-drawdown penalty (`score = net_pnl_zar - 2 * max_dd_zar`), write results to `backtest/prompt_lab_results.jsonl` (variant, window, trades, pnl, dd, api_cost, score).
+3. Champion selection: best score wins; update `champion.txt`. Never auto-delete losing variants (audit trail).
+4. Ralph-loop mode `--auto N`: N iterations of [run champion + challenger → if challenger wins, promote → generate next challenger by mutating champion (the orchestrating Claude Code session writes the mutation based on the decision-log analysis; the lab pauses and prints what happened for the orchestrator to act)]. The lab is the harness; the mutation intelligence is the orchestrator session.
+5. Requires ANTHROPIC_API_KEY; if absent, lab exits with a clear message. Heuristic backend usable for harness smoke tests (no API).
+6. Tests: scoring math, champion promotion, results file append, no-key graceful exit (all with heuristic/mocked backend).
