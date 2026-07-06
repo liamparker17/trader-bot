@@ -118,8 +118,13 @@ class TraderBot:
         )
         self.growth = GrowthManager(self.config)
 
-        # Executor
-        self.executor = Executor(self.config, self.client, self.risk_manager)
+        # Executor — wire a best-effort Telegram alert callback so
+        # close_all()'s per-batch alert (including any close failures)
+        # actually reaches the operator in production.
+        self.executor = Executor(
+            self.config, self.client, self.risk_manager,
+            alert_callback=self._on_executor_alert,
+        )
 
         # Load ML model
         if not self.predictor.load_model():
@@ -203,6 +208,9 @@ class TraderBot:
                 logger.debug(f"AI briefing skipped: {e}")
 
         last_status_log = 0
+        last_balance_check = 0.0
+        cached_balance = None
+        cached_equity = None
         try:
             while self.running:
                 # Main loop runs at ~1 second intervals
@@ -226,7 +234,45 @@ class TraderBot:
                     except Exception:
                         pass
 
-                # Check for emergency shutdown
+                # Refresh cached balance/equity every 5s (not every ~1s
+                # iteration) so the emergency checks below don't hammer
+                # account_info on the broker.
+                if now - last_balance_check >= 5:
+                    last_balance_check = now
+                    try:
+                        summary = self.client.get_account_summary()
+                        cached_balance = summary["balance"]
+                        cached_equity = summary["equity"]
+                    except Exception as e:
+                        logger.debug(f"Balance/equity refresh failed: {e}")
+
+                # Session boundary (21:00 UTC) reset + daily-drawdown
+                # emergency check — runs every iteration, independent of
+                # whether a trade signal fired. Lifts the resumable daily
+                # block and resets the consecutive-loss counter at the
+                # boundary; on a fresh daily-drawdown breach, closes all
+                # positions but keeps the bot RUNNING with entries blocked
+                # until the next boundary (see RiskManager.entries_blocked).
+                if cached_balance is not None:
+                    self.risk_manager.check_session_boundary(cached_balance)
+                    if self.risk_manager.check_drawdown_emergency(cached_balance, cached_equity):
+                        logger.critical(
+                            "DAILY DRAWDOWN BREACH — closing all positions; "
+                            "bot stays running, entries blocked until next "
+                            "session boundary"
+                        )
+                        self.executor.close_all("daily_drawdown")
+                        try:
+                            drawdown_pct = self.risk_manager.drawdown.get_daily_drawdown_pct(
+                                cached_balance
+                            )
+                            self.telegram.daily_stop(cached_balance, drawdown_pct)
+                        except Exception:
+                            pass
+
+                # Check for PERMANENT emergency shutdown (hard floor breach /
+                # circuit-breaker shutdown) — distinct from the resumable
+                # daily-drawdown block above. Stops the bot entirely.
                 if self.risk_manager.close_all_signal():
                     logger.critical("Emergency shutdown signal — closing all positions")
                     results = self.executor.close_all("emergency_shutdown")
@@ -883,6 +929,26 @@ class TraderBot:
         """Callback when a milestone is reached."""
         self.telegram.milestone_reached(milestone, balance, message)
         self.journal.record_event("milestone", message, {"milestone": milestone, "balance": balance})
+
+    def _on_executor_alert(self, event: str, data: dict):
+        """
+        Best-effort Telegram bridge for Executor alerts (currently just
+        close_all's batch summary). Never allowed to raise into the
+        executor — a failed alert must not block position management.
+        """
+        try:
+            if event == "close_all":
+                reason = data.get("reason", "unknown")
+                closed = data.get("closed", 0)
+                requested = data.get("requested", 0)
+                msg = f"close_all ({reason}): {closed}/{requested} positions closed"
+                failures = data.get("failures") or []
+                if failures:
+                    msg += f" | {len(failures)} FAILED: {failures}"
+                self.telegram._send(f"<b>Position close-all:</b> {msg}")
+                self.journal.record_event("close_all", msg, data)
+        except Exception as e:
+            logger.error(f"_on_executor_alert failed: {e}")
 
     def fetch_historical_data(self):
         """Fetch and cache historical data for all instruments."""
