@@ -15,6 +15,7 @@ Handles:
 """
 
 import logging
+import random
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Generator
@@ -130,6 +131,23 @@ class MT5Client:
             self._connected = False
             if not self.connect():
                 raise MT5Error("Failed to reconnect to MT5")
+
+    def is_broker_connected(self) -> bool:
+        """
+        Cheap health probe for the MT5 terminal/broker connection.
+
+        Checks terminal_info().connected AND that account_info() is
+        available. Never raises — any failure is treated as disconnected.
+        Intended to be called once per main-loop iteration.
+        """
+        try:
+            terminal = mt5.terminal_info()
+            if terminal is None or not getattr(terminal, "connected", False):
+                return False
+            return mt5.account_info() is not None
+        except Exception as e:
+            logger.warning(f"is_broker_connected() check failed: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # Account
@@ -378,7 +396,13 @@ class MT5Client:
         last_ticks = {}
         logger.info(f"Price polling started for {instruments}")
 
+        consecutive_errors = 0
+        base_backoff = 1.0
+        max_backoff = 60.0
+
         while True:
+            loop_had_error = False
+
             for sym in symbols:
                 try:
                     tick = mt5.symbol_info_tick(sym)
@@ -405,9 +429,29 @@ class MT5Client:
 
                 except Exception as e:
                     logger.warning(f"Tick error for {sym}: {e}")
+                    loop_had_error = True
 
-            # Poll interval — ~100ms for responsive candle building
-            time.sleep(0.1)
+            # Cheap health probe: if the broker connection itself is down,
+            # treat this iteration as an error too so we back off instead
+            # of spamming symbol_info_tick() every 100ms.
+            if not self.is_broker_connected():
+                loop_had_error = True
+
+            if loop_had_error:
+                consecutive_errors += 1
+                raw_delay = base_backoff * (2 ** (consecutive_errors - 1))
+                capped_delay = min(raw_delay, max_backoff)
+                jitter = random.uniform(0, capped_delay * 0.1)
+                sleep_time = min(capped_delay + jitter, max_backoff)
+                logger.warning(
+                    f"MT5 stream degraded (consecutive errors={consecutive_errors}); "
+                    f"backing off {sleep_time:.1f}s"
+                )
+                time.sleep(sleep_time)
+            else:
+                consecutive_errors = 0
+                # Poll interval — ~100ms for responsive candle building
+                time.sleep(0.1)
 
     # ------------------------------------------------------------------
     # Orders
