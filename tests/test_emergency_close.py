@@ -106,8 +106,9 @@ def test_daily_drawdown_breach_blocks_new_entries(tmp_path):
     assert approval.approved is False
     assert "session boundary" in approval.reason.lower()
 
-    assert rm.close_all_signal() is True
-    assert rm.close_all_reason == "daily_drawdown"
+    # Resumable daily block — NOT the permanent kill switch.
+    assert rm.entries_blocked is True
+    assert rm.close_all_signal() is False
 
 
 def test_evaluate_trade_flags_breach_directly(tmp_path):
@@ -117,19 +118,21 @@ def test_evaluate_trade_flags_breach_directly(tmp_path):
     approval = rm.evaluate_trade(_trade_request(), current_balance=950.0)
     assert approval.approved is False
     assert "drawdown limit" in approval.reason.lower()
-    assert rm.close_all_signal() is True
+    assert rm.entries_blocked is True
+    assert rm.close_all_signal() is False
 
 
 def test_block_lifts_and_entries_resume_after_boundary(tmp_path):
     rm, clock_box = _risk_manager(tmp_path)
     rm.check_drawdown_emergency(950.0)
-    assert rm.close_all_signal() is True
+    assert rm.entries_blocked is True
+    assert rm.close_all_signal() is False
 
     # Cross the 21:00 UTC boundary
     clock_box["now"] = datetime(2026, 7, 8, 21, 0, tzinfo=timezone.utc)
     rm.check_session_boundary(950.0)
 
-    assert rm.close_all_signal() is False
+    assert rm.entries_blocked is False
     # New daily_start_balance is 950 post-reset, so a further evaluate at
     # the same 950 balance shows 0% daily loss and should pass drawdown.
     approval = rm.evaluate_trade(_trade_request(), current_balance=950.0)
@@ -200,7 +203,8 @@ def test_check_and_manage_positions_triggers_close_all_on_breach(tmp_path):
 
     assert executor.open_trades == {}
     assert client.close_trade.call_count == 1
-    assert rm.close_all_signal() is True  # remains blocked until boundary
+    assert rm.entries_blocked is True  # remains blocked until boundary
+    assert rm.close_all_signal() is False  # NOT the permanent kill switch
     assert any(event == "close_all" and data["reason"] == "daily_drawdown" for event, data in alerts)
 
 
@@ -229,3 +233,94 @@ def test_close_all_signal_also_covers_circuit_breaker_shutdown(tmp_path):
 
     assert executor.open_trades == {}
     assert "circuit_breaker_shutdown" in rm.close_all_reason
+    # Permanent kill path is unaffected by the daily-drawdown fix.
+    assert rm.close_all_signal() is True
+
+
+# ---------------------------------------------------------------------------
+# main.py-style loop wiring: simulate loop iterations directly against the
+# RiskManager/Executor methods main.run() now calls (Task 4 review fix).
+# ---------------------------------------------------------------------------
+
+def _loop_iteration(rm, executor, balance, equity=None):
+    """Mirror what main.py's run() loop now does each iteration."""
+    equity = equity if equity is not None else balance
+    rm.check_session_boundary(balance)
+    if rm.check_drawdown_emergency(balance, equity):
+        executor.close_all("daily_drawdown")
+    if rm.close_all_signal():
+        if executor.open_trades:
+            executor.close_all(rm.close_all_reason or "risk_shutdown")
+        return True  # bot would stop
+    return False
+
+
+def test_boundary_crossing_lifts_block_without_any_trade_signal(tmp_path):
+    rm, clock_box = _risk_manager(tmp_path)
+    client = _mock_client()
+    executor = Executor(_config(), client, rm)
+    executor.open_trades["t1"] = _open_trade("t1")
+
+    # Iteration 1: daily-drawdown breach -> close-all fires, bot keeps running
+    stopped = _loop_iteration(rm, executor, balance=950.0)
+    assert stopped is False
+    assert executor.open_trades == {}
+    assert rm.entries_blocked is True
+
+    # Iteration 2, still before boundary: no change, still blocked
+    stopped = _loop_iteration(rm, executor, balance=950.0)
+    assert stopped is False
+    assert rm.entries_blocked is True
+
+    # Iteration 3: boundary crossed (no trade signal involved at all) ->
+    # check_session_boundary (called inside check_drawdown_emergency) lifts
+    # the block on its own.
+    clock_box["now"] = datetime(2026, 7, 8, 21, 0, tzinfo=timezone.utc)
+    stopped = _loop_iteration(rm, executor, balance=950.0)
+    assert stopped is False
+    assert rm.entries_blocked is False
+
+
+def test_permanent_kill_path_unchanged_by_loop_wiring(tmp_path):
+    rm, _ = _risk_manager(tmp_path)
+    client = _mock_client()
+    executor = Executor(_config(), client, rm)
+    executor.open_trades["t1"] = _open_trade("t1")
+
+    rm.circuit_breaker._shutdown("HARD FLOOR BREACH: test")
+
+    stopped = _loop_iteration(rm, executor, balance=1000.0)
+
+    assert stopped is True
+    assert executor.open_trades == {}
+    assert rm.close_all_signal() is True
+
+
+# ---------------------------------------------------------------------------
+# close_all: per-failure detail + CRITICAL logging on emergency close
+# ---------------------------------------------------------------------------
+
+def test_close_all_reports_per_trade_failure_detail(tmp_path, caplog):
+    import logging as _logging
+    from src.data.mt5_client import MT5Error
+
+    rm, _ = _risk_manager(tmp_path)
+    client = _mock_client()
+    client.close_trade.side_effect = MT5Error("broker rejected close")
+    alerts = []
+    executor = Executor(_config(), client, rm, alert_callback=lambda event, data: alerts.append((event, data)))
+    executor.open_trades["t1"] = _open_trade("t1")
+
+    with caplog.at_level(_logging.CRITICAL, logger="traderbot.execution"):
+        results = executor.close_all(reason="daily_drawdown")
+
+    assert results == []
+    assert "t1" in executor.open_trades  # failed close leaves trade open
+    assert len(alerts) == 1
+    event, data = alerts[0]
+    assert event == "close_all"
+    assert data["closed"] == 0
+    assert len(data["failures"]) == 1
+    assert data["failures"][0]["trade_id"] == "t1"
+    assert "broker rejected close" in data["failures"][0]["error"]
+    assert any(record.levelno == _logging.CRITICAL for record in caplog.records)

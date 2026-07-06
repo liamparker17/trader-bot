@@ -371,17 +371,34 @@ class RiskManager:
         }
 
     def close_all_signal(self) -> bool:
-        """Check if we should close all positions (emergency)."""
-        return self.circuit_breaker.is_shutdown or self._blocked_until_boundary
+        """
+        Check if we should PERMANENTLY stop the bot and close all positions
+        (hard-floor breach / circuit-breaker shutdown).
+
+        This is deliberately NOT the same thing as the resumable daily-
+        drawdown block (`entries_blocked` / `_blocked_until_boundary`):
+        that one lifts automatically at the next session boundary and must
+        not stop the bot. Use `check_drawdown_emergency()` to detect and
+        react to the daily-drawdown breach instead.
+        """
+        return self.circuit_breaker.is_shutdown
 
     @property
     def close_all_reason(self) -> str:
         """Human-readable reason for the current close_all_signal(), if any."""
         if self.circuit_breaker.is_shutdown:
             return f"circuit_breaker_shutdown: {self.circuit_breaker.shutdown_reason}"
-        if self._blocked_until_boundary:
-            return "daily_drawdown"
         return ""
+
+    @property
+    def entries_blocked(self) -> bool:
+        """
+        True while new entries are blocked by a daily-drawdown breach that
+        hasn't yet been lifted by a session boundary crossing. Resumable —
+        does NOT imply the bot should stop or that open positions should be
+        closed again (that already happened when the breach was detected).
+        """
+        return self._blocked_until_boundary
 
     def force_resume(self):
         """Manual override to resume from pause (not shutdown)."""

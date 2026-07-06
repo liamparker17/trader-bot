@@ -398,18 +398,22 @@ class Executor:
         # Update position count
         self.risk_manager.open_position_count = len(self.open_trades)
 
+    # Reasons that indicate this close_all is an emergency response (daily
+    # drawdown breach or a permanent circuit-breaker/hard-floor shutdown),
+    # as opposed to a manual/routine close. Failures during these are
+    # logged at CRITICAL rather than ERROR — a stuck position during an
+    # emergency close is a much bigger deal than during a manual close.
+    _EMERGENCY_REASONS = ("daily_drawdown", "emergency_shutdown")
+
     def close_trade(self, trade_id: str, reason: str = "manual") -> Optional[TradeResult]:
-        """Close a specific trade."""
+        """Close a specific trade. Raises MT5Error on broker failure so
+        callers (close_all) can capture per-trade failure detail."""
         trade = self.open_trades.get(trade_id)
         if not trade:
             logger.warning(f"Trade {trade_id} not found in open trades")
             return None
 
-        try:
-            self.client.close_trade(trade_id)
-        except MT5Error as e:
-            logger.error(f"Failed to close trade {trade_id}: {e}")
-            return None
+        self.client.close_trade(trade_id)
 
         return self._record_closed_trade(trade, exit_reason=reason)
 
@@ -420,11 +424,28 @@ class Executor:
         drawdown / circuit-breaker emergency close-all (see
         check_and_manage_positions and RiskManager.close_all_signal()).
         Sends one alert summarizing the batch via alert_callback, if wired.
+
+        Any per-trade close failures are collected (trade id + error) and
+        included in both the log output and the alert payload so they
+        aren't silently swallowed. Failures during an emergency close
+        (daily drawdown / permanent shutdown) are logged at CRITICAL.
         """
+        is_emergency = reason in self._EMERGENCY_REASONS or "shutdown" in reason
         trade_ids = list(self.open_trades.keys())
         results = []
+        failures = []
         for trade_id in trade_ids:
-            result = self.close_trade(trade_id, reason=reason)
+            try:
+                result = self.close_trade(trade_id, reason=reason)
+            except MT5Error as e:
+                failures.append({"trade_id": trade_id, "error": str(e)})
+                log_fn = logger.critical if is_emergency else logger.error
+                log_fn(
+                    f"Failed to close trade {trade_id} during close_all "
+                    f"(reason={reason}): {e}"
+                )
+                continue
+
             if result:
                 results.append(result)
                 logger.info(
@@ -432,19 +453,26 @@ class Executor:
                     f"| reason: {reason} | PnL: R{result.pnl_zar:.2f} ({result.pnl_pips:.1f} pips)"
                 )
 
+        if failures:
+            log_fn = logger.critical if is_emergency else logger.error
+            log_fn(
+                f"close_all ({reason}): {len(failures)}/{len(trade_ids)} trades "
+                f"FAILED to close: {failures}"
+            )
+
         logger.info(f"Closed all: {len(results)}/{len(trade_ids)} trades ({reason})")
 
         if self.alert_callback:
             try:
-                self.alert_callback(
-                    "close_all",
-                    {
-                        "reason": reason,
-                        "requested": len(trade_ids),
-                        "closed": len(results),
-                        "results": results,
-                    },
-                )
+                payload = {
+                    "reason": reason,
+                    "requested": len(trade_ids),
+                    "closed": len(results),
+                    "results": results,
+                }
+                if failures:
+                    payload["failures"] = failures
+                self.alert_callback("close_all", payload)
             except Exception as e:
                 logger.error(f"close_all alert_callback failed: {e}")
 

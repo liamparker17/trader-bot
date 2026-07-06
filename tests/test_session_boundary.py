@@ -214,10 +214,14 @@ def test_risk_manager_lifts_daily_drawdown_block_at_boundary(tmp_path):
     # Force the block flag on directly (breach mechanics covered elsewhere)
     rm._blocked_until_boundary = True
     rm._block_reason = "Daily drawdown 5.0% >= limit 4.0%"
-    assert rm.close_all_signal() is True
+    assert rm.entries_blocked is True
+    # The resumable daily-drawdown block must NOT flow through
+    # close_all_signal() — that's reserved for the permanent kill switch.
+    assert rm.close_all_signal() is False
 
     clock_box["now"] = datetime(2026, 7, 8, 21, 0, tzinfo=timezone.utc)
     rm.check_session_boundary()
 
     assert rm._blocked_until_boundary is False
+    assert rm.entries_blocked is False
     assert rm.close_all_signal() is False
