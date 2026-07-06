@@ -188,3 +188,10 @@
 4. Ralph-loop mode `--auto N`: N iterations of [run champion + challenger → if challenger wins, promote → generate next challenger by mutating champion (the orchestrating Claude Code session writes the mutation based on the decision-log analysis; the lab pauses and prints what happened for the orchestrator to act)]. The lab is the harness; the mutation intelligence is the orchestrator session.
 5. Requires ANTHROPIC_API_KEY; if absent, lab exits with a clear message. Heuristic backend usable for harness smoke tests (no API).
 6. Tests: scoring math, champion promotion, results file append, no-key graceful exit (all with heuristic/mocked backend).
+
+## Amendment (2026-07-07): API budget governor
+
+Binds Tasks 13 & 14:
+- settings.yaml `manager:` block gains: `api_budget_zar_total: 500`, `api_budget_days: 10`, `api_budget_zar_per_day: 50`.
+- Scheduler enforcement (Task 13): before each cycle, sum `manager_log.cost_zar`. If today's spend ≥ per-day cap OR cumulative spend ≥ total budget → skip cycle, log `outcome=budget_exhausted`, Telegram-warn once per day. Timer cycles degrade gracefully (fewer, evenly spaced) as the daily cap approaches: if remaining daily budget < estimated cycle cost × remaining cycles, stretch the interval.
+- Day-10 verdict (Task 14): scorecard gains `justification_report()` — cumulative net P&L, cumulative API cost, net-after-cost, verdict line (`SELF-FUNDING` if net-after-cost > 0 and P&L uplift vs heuristic baseline > API cost, else `NOT JUSTIFIED`). Emitted in daily summary from day 8 onward and via `tb manager --verdict`.
