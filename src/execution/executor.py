@@ -202,9 +202,37 @@ class Executor:
 
         fill_price = float(fill.get("price", entry_price))
         trade_id = fill.get("tradeOpened", {}).get("tradeID", "")
-        if not trade_id:
-            # Sometimes OANDA nests it differently
-            trade_id = str(fill.get("id", f"local_{int(time.time())}"))
+
+        # A missing/zero ticket means the broker did not actually confirm
+        # a real position (or the response was malformed) — treat this as
+        # a failed order. We must NEVER fabricate a synthetic trade ID
+        # (e.g. a timestamp-based placeholder): that would create a
+        # position/journal record with no corresponding real MT5 ticket,
+        # leaving the bot's local state permanently out of sync with the
+        # broker. Instead, log + alert and bail out with no position
+        # tracked and no journal write (callers only record a trade when
+        # execute_signal returns non-None).
+        if not trade_id or trade_id == "0":
+            logger.error(
+                f"Order for {instrument} filled but no MT5 ticket was "
+                f"returned (response={response!r}). Treating as a failed "
+                f"order — not tracking a position."
+            )
+            self.risk_manager.record_api_error()
+            if self.alert_callback:
+                try:
+                    self.alert_callback(
+                        "order_failed",
+                        {
+                            "instrument": instrument,
+                            "direction": direction,
+                            "reason": "missing_ticket",
+                            "response": response,
+                        },
+                    )
+                except Exception as e:
+                    logger.error(f"order_failed alert_callback failed: {e}")
+            return None
 
         # Check slippage
         slippage_pips = abs(fill_price - entry_price) / pip_size

@@ -46,6 +46,7 @@ class TelegramBot:
         self.alert_retrain = config.get("telegram.alert_on_ml_retrain", True)
         self.alert_api_error = config.get("telegram.alert_on_api_error", True)
         self.alert_milestone = config.get("telegram.alert_on_milestone", True)
+        self.alert_bot_error = config.get("telegram.alert_on_bot_error", True)
 
         if self.enabled and (not self.token or not self.chat_id):
             logger.warning("Telegram enabled but token/chat_id not set. Alerts disabled.")
@@ -221,6 +222,25 @@ class TelegramBot:
             f"{error_message}"
         )
         self._send(text)
+
+    def bot_error(self, exc_type: str, message: str):
+        """
+        Alert: unhandled exception caught by the main-loop catch-all.
+        Best-effort \u2014 must never raise into the caller (the whole point of
+        this alert is to survive errors, so a broken send path can't be
+        allowed to take the loop down too).
+        """
+        if not self.alert_bot_error:
+            return
+        try:
+            text = (
+                f"\U0001f6a8 <b>Bot Error</b>\n"
+                f"Type: {exc_type}\n"
+                f"{message}"
+            )
+            self._send(text)
+        except Exception as e:
+            logger.warning(f"bot_error alert failed: {e}")
 
     def bot_started(self, balance: float, environment: str):
         """Alert: bot started."""

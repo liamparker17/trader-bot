@@ -15,6 +15,8 @@ import time
 import logging
 import logging.handlers
 import threading
+from datetime import datetime, timezone
+from typing import Callable, Optional
 from pathlib import Path
 
 from src.config import load_config
@@ -25,6 +27,7 @@ from src.indicators.engine import IndicatorEngine
 from src.ml.predictor import Predictor
 from src.ml.evaluator import Evaluator
 from src.risk.manager import RiskManager, TradeRequest
+from src.risk.drawdown_tracker import session_boundary
 from src.execution.executor import Executor
 from src.growth.reinvestment import GrowthManager
 from src.growth.milestone_tracker import MilestoneTracker
@@ -36,6 +39,71 @@ from src.ai.shadow_trader import ShadowTrader
 from src.ai.approval_queue import ApprovalQueue
 
 logger = logging.getLogger("traderbot")
+
+
+class DailySummaryScheduler:
+    """
+    Decides when the once-daily Telegram summary is due, at the same
+    trading session boundary (default 21:00 UTC) used elsewhere for
+    daily/weekly drawdown resets (see `session_boundary()` in
+    drawdown_tracker.py).
+
+    Config fallback chain (matches Task 4's session-boundary pattern):
+        trading.session_reset_hour_utc -> risk.session_boundary_hour_utc -> 21
+
+    Guards against double-firing two ways:
+    - An in-memory `last fired` boundary date, for the common case of a
+      single long-running process.
+    - A persisted journal event row (event_type="daily_summary_sent"),
+      so a process restart shortly after the boundary doesn't re-send.
+    """
+
+    EVENT_TYPE = "daily_summary_sent"
+
+    def __init__(self, config, journal, clock: Optional[Callable[[], datetime]] = None):
+        self.config = config
+        self.journal = journal
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.reset_hour = config.get(
+            "trading.session_reset_hour_utc",
+            config.get("risk.session_boundary_hour_utc", 21),
+        )
+        self._last_fired_date: Optional[str] = None
+
+    def due(self) -> Optional[str]:
+        """
+        Return the boundary date string ("YYYY-MM-DD") if a summary is
+        due and hasn't already been sent for that boundary, else None.
+        """
+        now = self.clock()
+        boundary = session_boundary(now, self.reset_hour)
+        boundary_date = boundary.date().isoformat()
+
+        if self._last_fired_date == boundary_date:
+            return None
+
+        # Survive process restarts: check the journal for a prior
+        # daily_summary_sent event recorded for this boundary date.
+        try:
+            events = self.journal.get_events(event_type=self.EVENT_TYPE, limit=10)
+            if events is not None and not events.empty and "message" in events.columns:
+                if boundary_date in set(events["message"]):
+                    self._last_fired_date = boundary_date
+                    return None
+        except Exception as e:
+            logger.debug(f"DailySummaryScheduler: journal lookback failed: {e}")
+
+        return boundary_date
+
+    def mark_fired(self, boundary_date: str):
+        """Record that the summary for `boundary_date` has been sent."""
+        self._last_fired_date = boundary_date
+        try:
+            self.journal.record_event(
+                self.EVENT_TYPE, boundary_date, {"boundary_date": boundary_date}
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record {self.EVENT_TYPE} event: {e}")
 
 
 class TraderBot:
@@ -62,6 +130,13 @@ class TraderBot:
         self.shadow = None
         self.approval_queue = None
         self.instance_lock = InstanceLock()
+        self.daily_summary_scheduler = None
+
+        # Main-loop catch-all (item S): rate-limit Telegram alerts to at
+        # most one per exception type every N seconds, so a repeatedly
+        # failing iteration doesn't spam Telegram.
+        self._loop_error_last_alert: dict = {}
+        self._loop_error_cooldown_seconds = 300
 
     def setup(self):
         """Initialize all modules."""
@@ -99,6 +174,7 @@ class TraderBot:
         self.journal = TradeJournal(self.config)
         self.performance = PerformanceTracker(self.journal)
         self.telegram = TelegramBot(self.config)
+        self.daily_summary_scheduler = DailySummaryScheduler(self.config, self.journal)
 
         # AI Analyst (optional Claude layer)
         self.analyst = AIAnalyst(self.config)
@@ -213,76 +289,90 @@ class TraderBot:
         cached_equity = None
         try:
             while self.running:
-                # Main loop runs at ~1 second intervals
-                # Actual trading decisions happen in _on_candle_complete callback
-                time.sleep(1)
+                # Catch-all for a single iteration: an unhandled exception
+                # here must never kill the loop silently. Log the full
+                # traceback, fire a rate-limited Telegram alert, and let
+                # the loop continue on the next iteration.
+                try:
+                    # Main loop runs at ~1 second intervals
+                    # Actual trading decisions happen in _on_candle_complete callback
+                    time.sleep(1)
 
-                # Hourly performance status log
-                now = time.time()
-                if now - last_status_log >= 3600:
-                    last_status_log = now
-                    try:
-                        bal = self.client.get_account_balance()
-                        summary = self.performance.get_summary()
-                        logger.info(
-                            f"[STATUS] Balance: ${bal:.2f} | "
-                            f"Trades: {summary.get('total_trades', 0)} | "
-                            f"WR: {summary.get('win_rate', 0):.1%} | "
-                            f"PnL: ${summary.get('total_pnl', 0):.2f} | "
-                            f"PF: {summary.get('profit_factor', 0):.2f}"
-                        )
-                    except Exception:
-                        pass
-
-                # Refresh cached balance/equity every 5s (not every ~1s
-                # iteration) so the emergency checks below don't hammer
-                # account_info on the broker.
-                if now - last_balance_check >= 5:
-                    last_balance_check = now
-                    try:
-                        summary = self.client.get_account_summary()
-                        cached_balance = summary["balance"]
-                        cached_equity = summary["equity"]
-                    except Exception as e:
-                        logger.debug(f"Balance/equity refresh failed: {e}")
-
-                # Session boundary (21:00 UTC) reset + daily-drawdown
-                # emergency check — runs every iteration, independent of
-                # whether a trade signal fired. Lifts the resumable daily
-                # block and resets the consecutive-loss counter at the
-                # boundary; on a fresh daily-drawdown breach, closes all
-                # positions but keeps the bot RUNNING with entries blocked
-                # until the next boundary (see RiskManager.entries_blocked).
-                if cached_balance is not None:
-                    self.risk_manager.check_session_boundary(cached_balance)
-                    if self.risk_manager.check_drawdown_emergency(cached_balance, cached_equity):
-                        logger.critical(
-                            "DAILY DRAWDOWN BREACH — closing all positions; "
-                            "bot stays running, entries blocked until next "
-                            "session boundary"
-                        )
-                        self.executor.close_all("daily_drawdown")
+                    # Hourly performance status log
+                    now = time.time()
+                    if now - last_status_log >= 3600:
+                        last_status_log = now
                         try:
-                            drawdown_pct = self.risk_manager.drawdown.get_daily_drawdown_pct(
-                                cached_balance
+                            bal = self.client.get_account_balance()
+                            summary = self.performance.get_summary()
+                            logger.info(
+                                f"[STATUS] Balance: ${bal:.2f} | "
+                                f"Trades: {summary.get('total_trades', 0)} | "
+                                f"WR: {summary.get('win_rate', 0):.1%} | "
+                                f"PnL: ${summary.get('total_pnl', 0):.2f} | "
+                                f"PF: {summary.get('profit_factor', 0):.2f}"
                             )
-                            self.telegram.daily_stop(cached_balance, drawdown_pct)
                         except Exception:
                             pass
 
-                # Check for PERMANENT emergency shutdown (hard floor breach /
-                # circuit-breaker shutdown) — distinct from the resumable
-                # daily-drawdown block above. Stops the bot entirely.
-                if self.risk_manager.close_all_signal():
-                    logger.critical("Emergency shutdown signal — closing all positions")
-                    results = self.executor.close_all("emergency_shutdown")
-                    try:
-                        balance = self.client.get_account_balance()
-                        self.telegram.emergency_stop(balance, "Hard floor breach")
-                    except Exception:
-                        pass
-                    self.running = False
-                    break
+                    # Refresh cached balance/equity every 5s (not every ~1s
+                    # iteration) so the emergency checks below don't hammer
+                    # account_info on the broker.
+                    if now - last_balance_check >= 5:
+                        last_balance_check = now
+                        try:
+                            summary = self.client.get_account_summary()
+                            cached_balance = summary["balance"]
+                            cached_equity = summary["equity"]
+                        except Exception as e:
+                            logger.debug(f"Balance/equity refresh failed: {e}")
+
+                    # Session boundary (21:00 UTC) reset + daily-drawdown
+                    # emergency check — runs every iteration, independent of
+                    # whether a trade signal fired. Lifts the resumable daily
+                    # block and resets the consecutive-loss counter at the
+                    # boundary; on a fresh daily-drawdown breach, closes all
+                    # positions but keeps the bot RUNNING with entries blocked
+                    # until the next boundary (see RiskManager.entries_blocked).
+                    if cached_balance is not None:
+                        self.risk_manager.check_session_boundary(cached_balance)
+                        if self.risk_manager.check_drawdown_emergency(cached_balance, cached_equity):
+                            logger.critical(
+                                "DAILY DRAWDOWN BREACH — closing all positions; "
+                                "bot stays running, entries blocked until next "
+                                "session boundary"
+                            )
+                            self.executor.close_all("daily_drawdown")
+                            try:
+                                drawdown_pct = self.risk_manager.drawdown.get_daily_drawdown_pct(
+                                    cached_balance
+                                )
+                                self.telegram.daily_stop(cached_balance, drawdown_pct)
+                            except Exception:
+                                pass
+
+                        # Once-per-day Telegram summary at the same 21:00 UTC
+                        # session boundary. Guarded against double-fire (in
+                        # memory + a persisted journal event row) inside the
+                        # scheduler itself.
+                        self._maybe_send_daily_summary(cached_balance)
+
+                    # Check for PERMANENT emergency shutdown (hard floor breach /
+                    # circuit-breaker shutdown) — distinct from the resumable
+                    # daily-drawdown block above. Stops the bot entirely.
+                    if self.risk_manager.close_all_signal():
+                        logger.critical("Emergency shutdown signal — closing all positions")
+                        results = self.executor.close_all("emergency_shutdown")
+                        try:
+                            balance = self.client.get_account_balance()
+                            self.telegram.emergency_stop(balance, "Hard floor breach")
+                        except Exception:
+                            pass
+                        self.running = False
+                        break
+
+                except Exception as e:
+                    self._handle_loop_exception(e)
 
         except Exception as e:
             logger.critical(f"Unhandled exception in main loop: {e}", exc_info=True)
@@ -932,9 +1022,10 @@ class TraderBot:
 
     def _on_executor_alert(self, event: str, data: dict):
         """
-        Best-effort Telegram bridge for Executor alerts (currently just
-        close_all's batch summary). Never allowed to raise into the
-        executor — a failed alert must not block position management.
+        Best-effort Telegram bridge for Executor alerts (close_all's batch
+        summary, and failed orders with no real MT5 ticket). Never allowed
+        to raise into the executor — a failed alert must not block
+        position management.
         """
         try:
             if event == "close_all":
@@ -947,8 +1038,70 @@ class TraderBot:
                     msg += f" | {len(failures)} FAILED: {failures}"
                 self.telegram._send(f"<b>Position close-all:</b> {msg}")
                 self.journal.record_event("close_all", msg, data)
+            elif event == "order_failed":
+                instrument = data.get("instrument", "?")
+                direction = data.get("direction", "?")
+                reason = data.get("reason", "unknown")
+                msg = f"Order failed for {instrument} {direction}: {reason} (no MT5 ticket returned)"
+                self.telegram._send(f"⚠️ <b>Order Failed</b>\n{msg}")
+                self.journal.record_event("order_failed", msg, data)
         except Exception as e:
             logger.error(f"_on_executor_alert failed: {e}")
+
+    def _maybe_send_daily_summary(self, balance: float):
+        """
+        Fire the once-per-day Telegram summary at the 21:00 UTC session
+        boundary (or whatever `trading.session_reset_hour_utc` /
+        `risk.session_boundary_hour_utc` resolves to). Best-effort — must
+        never raise into the main loop.
+        """
+        if not self.daily_summary_scheduler:
+            return
+        try:
+            boundary_date = self.daily_summary_scheduler.due()
+            if boundary_date is None:
+                return
+
+            summary = self.performance.get_summary()
+            self.telegram.daily_summary(
+                date=boundary_date,
+                trades=summary.get("total_trades", 0),
+                wins=summary.get("wins", 0),
+                losses=summary.get("losses", 0),
+                pnl=summary.get("total_pnl", 0.0),
+                balance=balance,
+                win_rate=summary.get("win_rate", 0.0),
+                max_drawdown=summary.get("max_drawdown_pct", 0.0),
+            )
+            self.daily_summary_scheduler.mark_fired(boundary_date)
+        except Exception as e:
+            logger.error(f"Daily summary failed: {e}")
+
+    def _handle_loop_exception(self, exc: Exception):
+        """
+        Catch-all for an unhandled exception inside a single main-loop
+        iteration (item S). Logs the full traceback, sends a Telegram
+        alert rate-limited to once per 5 minutes per exception type, and
+        lets the loop continue — a single bad iteration must never kill
+        the bot silently.
+        """
+        exc_type = type(exc).__name__
+        logger.error(
+            f"Unhandled exception in main loop iteration ({exc_type}): {exc}",
+            exc_info=True,
+        )
+
+        now = time.time()
+        last_alert = self._loop_error_last_alert.get(exc_type, 0.0)
+        if now - last_alert >= self._loop_error_cooldown_seconds:
+            self._loop_error_last_alert[exc_type] = now
+            try:
+                self.telegram.bot_error(exc_type, str(exc))
+                self.journal.record_event(
+                    "bot_error", str(exc), {"exception_type": exc_type}
+                )
+            except Exception as e:
+                logger.error(f"_handle_loop_exception alert failed: {e}")
 
     def fetch_historical_data(self):
         """Fetch and cache historical data for all instruments."""
