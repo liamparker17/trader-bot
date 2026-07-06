@@ -73,3 +73,41 @@ def test_mt5_connected_never_raises_when_send_fails():
     bot._send = MagicMock(side_effect=RuntimeError("network down"))
 
     bot.mt5_connected()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# bot_error (Task 5, item S: main-loop catch-all alert)
+# ---------------------------------------------------------------------------
+
+def test_bot_error_sends_message_with_type_and_message():
+    bot = _make_bot()
+    bot._send = MagicMock()
+
+    bot.bot_error("ValueError", "boom")
+
+    bot._send.assert_called_once()
+    text = bot._send.call_args[0][0]
+    assert "ValueError" in text
+    assert "boom" in text
+
+
+def test_bot_error_never_raises_when_send_fails():
+    bot = _make_bot()
+    bot._send = MagicMock(side_effect=RuntimeError("network down"))
+
+    bot.bot_error("ValueError", "boom")  # must not raise
+
+
+def test_bot_error_respects_disabled_toggle():
+    config = MagicMock()
+    config.get.side_effect = lambda key, default=None: (
+        False if key == "telegram.alert_on_bot_error" else default
+    )
+    config.telegram_bot_token = "token"
+    config.telegram_chat_id = "chat"
+    bot = TelegramBot(config)
+    bot._send = MagicMock()
+
+    bot.bot_error("ValueError", "boom")
+
+    bot._send.assert_not_called()
