@@ -64,9 +64,14 @@ class TradeJournal:
                     trend_15min INTEGER,
                     indicators_json TEXT,
                     adjustments_json TEXT,
+                    commission REAL DEFAULT 0,
+                    swap REAL DEFAULT 0,
+                    net_pnl_zar REAL,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            self._migrate_fee_columns(conn)
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS daily_summary (
@@ -94,6 +99,32 @@ class TradeJournal:
 
         logger.info(f"Trade journal initialized: {self.db_path}")
 
+    def _migrate_fee_columns(self, conn: sqlite3.Connection):
+        """
+        Idempotently add fee/net-P&L columns to `trades` for DBs created
+        before Task 7. Guarded by PRAGMA table_info so it's safe to run
+        on every open, including already-migrated (or brand-new) DBs.
+        """
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        if "commission" not in existing:
+            conn.execute("ALTER TABLE trades ADD COLUMN commission REAL DEFAULT 0")
+        if "swap" not in existing:
+            conn.execute("ALTER TABLE trades ADD COLUMN swap REAL DEFAULT 0")
+        if "net_pnl_zar" not in existing:
+            conn.execute("ALTER TABLE trades ADD COLUMN net_pnl_zar REAL")
+
+    @staticmethod
+    def compute_net_pnl(gross_pnl: float, commission: float = 0.0, swap: float = 0.0) -> float:
+        """
+        Net P&L = gross + commission + swap.
+
+        Sign convention: MT5 reports both `commission` and `swap` on deal
+        objects as already-signed values, and in the overwhelming majority
+        of cases both are costs and therefore negative. Adding them to the
+        gross P&L yields the true net result without any extra negation.
+        """
+        return gross_pnl + commission + swap
+
     def record_trade(
         self,
         trade_id: str,
@@ -117,8 +148,14 @@ class TradeJournal:
         slippage_pips: float = 0.0,
         spread_at_entry: float = 0.0,
         balance_after: float = None,
+        commission: float = 0.0,
+        swap: float = 0.0,
     ):
         """Record a trade (can be called at open and updated at close)."""
+        net_pnl_zar = (
+            self.compute_net_pnl(pnl_zar, commission, swap)
+            if pnl_zar is not None else None
+        )
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO trades (
@@ -126,8 +163,9 @@ class TradeJournal:
                     exit_price, entry_time, exit_time, stop_loss, take_profit,
                     pnl_pips, pnl_zar, ml_confidence, exit_reason,
                     slippage_pips, spread_at_entry, balance_after,
-                    model_version, trend_15min, indicators_json, adjustments_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    model_version, trend_15min, indicators_json, adjustments_json,
+                    commission, swap, net_pnl_zar
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 trade_id, instrument, direction, units, entry_price,
                 exit_price,
@@ -139,6 +177,7 @@ class TradeJournal:
                 model_version, trend_15min,
                 json.dumps(indicators) if indicators else None,
                 json.dumps(adjustments) if adjustments else None,
+                commission, swap, net_pnl_zar,
             ))
 
     def record_event(self, event_type: str, message: str, data: dict = None):

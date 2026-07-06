@@ -8,8 +8,8 @@ Also calculates trading-specific metrics like profit factor and
 expected value per trade.
 """
 
-import json
 import logging
+import sqlite3
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -78,13 +78,33 @@ class Evaluator:
         self.last_retrain_time: Optional[datetime] = None
         self.model_version: Optional[str] = None
 
-        # Persistence
-        self._log_path = PROJECT_ROOT / "data" / "trade_logs" / "evaluator_state.json"
+        # Persistence — same SQLite DB as the trade journal, in a
+        # dedicated `evaluator_state` table (Task 7 / Fix K). This lets
+        # retrain-trigger counters survive a bot restart instead of only
+        # living in-memory.
+        db_path = config.get("monitoring.trade_journal_db", "data/trade_logs/trades.db")
+        self._db_path = PROJECT_ROOT / db_path
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_state_table()
+
+    def _init_state_table(self):
+        """Create the evaluator_state table if it doesn't exist (idempotent)."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS evaluator_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    trades_since_retrain INTEGER NOT NULL DEFAULT 0,
+                    last_retrain_time TEXT,
+                    model_version TEXT,
+                    updated_at TEXT
+                )
+            """)
 
     def record_trade(self, trade: TradeRecord):
         """Record a completed trade for evaluation."""
         self.trades.append(trade)
         self.trades_since_retrain += 1
+        self.save_state()
 
     def record_from_dict(self, trade_data: dict):
         """Record a trade from a dictionary (convenience method)."""
@@ -199,6 +219,7 @@ class Evaluator:
         self.trades_since_retrain = 0
         self.last_retrain_time = datetime.now(timezone.utc)
         self.model_version = model_version
+        self.save_state()
         logger.info(f"Evaluator reset for model {model_version}")
 
     def get_recent_win_rate(self, n: int = 100) -> float:
@@ -258,26 +279,41 @@ class Evaluator:
         return "\n".join(lines)
 
     def save_state(self):
-        """Save evaluator state to disk."""
-        state = {
-            "trades_since_retrain": self.trades_since_retrain,
-            "last_retrain_time": self.last_retrain_time.isoformat() if self.last_retrain_time else None,
-            "model_version": self.model_version,
-            "total_trades": len(self.trades),
-        }
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._log_path, "w") as f:
-            json.dump(state, f, indent=2)
+        """
+        Persist retrain-trigger counters to the `evaluator_state` table
+        (single row, id=1) so they survive a bot restart. Called
+        automatically on every `record_trade` / `mark_retrained`, and can
+        also be called explicitly (e.g. on startup/shutdown).
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("""
+                INSERT INTO evaluator_state
+                    (id, trades_since_retrain, last_retrain_time, model_version, updated_at)
+                VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    trades_since_retrain = excluded.trades_since_retrain,
+                    last_retrain_time = excluded.last_retrain_time,
+                    model_version = excluded.model_version,
+                    updated_at = excluded.updated_at
+            """, (
+                self.trades_since_retrain,
+                self.last_retrain_time.isoformat() if self.last_retrain_time else None,
+                self.model_version,
+                datetime.now(timezone.utc).isoformat(),
+            ))
 
     def load_state(self):
-        """Load evaluator state from disk."""
-        if self._log_path.exists():
-            with open(self._log_path) as f:
-                state = json.load(f)
-            self.trades_since_retrain = state.get("trades_since_retrain", 0)
-            if state.get("last_retrain_time"):
-                self.last_retrain_time = datetime.fromisoformat(state["last_retrain_time"])
-            self.model_version = state.get("model_version")
+        """Load persisted evaluator state from the journal DB, if present."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute("""
+                SELECT trades_since_retrain, last_retrain_time, model_version
+                FROM evaluator_state WHERE id = 1
+            """).fetchone()
+        if row is None:
+            return
+        self.trades_since_retrain = row[0] or 0
+        self.last_retrain_time = datetime.fromisoformat(row[1]) if row[1] else None
+        self.model_version = row[2]
 
     def _calculate_calibration(self, trades: list[TradeRecord]) -> dict:
         """
