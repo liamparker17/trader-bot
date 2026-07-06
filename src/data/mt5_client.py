@@ -15,6 +15,7 @@ Handles:
 """
 
 import logging
+import math
 import random
 import time
 from datetime import datetime, timezone, timedelta
@@ -25,8 +26,14 @@ import pandas as pd
 import numpy as np
 
 from src.config import Config
+from src.utils.timeutil import to_utc
 
 logger = logging.getLogger("traderbot.mt5")
+
+# Transient retcodes that warrant exactly one retry with a fresh price:
+# REQUOTE, PRICE_OFF (off quotes), PRICE_CHANGED. All other retcodes are
+# treated as hard failures (no retry) as before.
+RETRYABLE_RETCODES = {10004, 10021, 10020}
 
 
 # Map our granularity strings to MT5 timeframe constants
@@ -77,6 +84,13 @@ class MT5Client:
         # stream_prices() call.
         self._stream_cancelled = False
 
+        # Cache of instrument -> detected MT5 symbol (with broker suffix).
+        # Populated lazily by _to_mt5_symbol() and invalidated on every
+        # connect()/reconnect so suffix detection re-runs against the
+        # freshly (re)connected terminal instead of sticking with a
+        # mapping from a previous connection.
+        self._symbol_cache: dict[str, str] = {}
+
     # ------------------------------------------------------------------
     # Connection management
     # ------------------------------------------------------------------
@@ -87,6 +101,11 @@ class MT5Client:
 
         Returns True if connected successfully.
         """
+        # Any (re)connect invalidates previously detected symbol suffixes —
+        # the broker/terminal state (Market Watch selections, available
+        # symbols) can differ after a reconnect.
+        self.invalidate_symbol_cache()
+
         for attempt in range(1, self.max_retries + 1):
             try:
                 # Initialize MT5 terminal
@@ -226,7 +245,7 @@ class MT5Client:
                 "sl": p.sl,
                 "tp": p.tp,
                 "profit": p.profit,
-                "time": datetime.fromtimestamp(p.time, tz=timezone.utc),
+                "time": to_utc(p.time),
             }
             for p in positions
         ]
@@ -296,7 +315,7 @@ class MT5Client:
 
         candles = []
         for r in rates:
-            time_str = datetime.fromtimestamp(r['time'], tz=timezone.utc).strftime(
+            time_str = to_utc(r['time']).strftime(
                 "%Y-%m-%dT%H:%M:%S.000000000Z"
             )
             candles.append({
@@ -358,7 +377,7 @@ class MT5Client:
 
         candles = []
         for r in all_rates:
-            time_str = datetime.fromtimestamp(r['time'], tz=timezone.utc).strftime(
+            time_str = to_utc(r['time']).strftime(
                 "%Y-%m-%dT%H:%M:%S.000000000Z"
             )
             candles.append({
@@ -395,7 +414,7 @@ class MT5Client:
 
         return {
             "instrument": instrument,
-            "time": datetime.fromtimestamp(tick.time, tz=timezone.utc).isoformat(),
+            "time": to_utc(tick.time).isoformat(),
             "bids": [{"price": str(tick.bid)}],
             "asks": [{"price": str(tick.ask)}],
             "bid": tick.bid,
@@ -452,9 +471,9 @@ class MT5Client:
                     yield {
                         "type": "PRICE",
                         "instrument": instrument,
-                        "time": datetime.fromtimestamp(
-                            tick.time, tz=timezone.utc
-                        ).strftime("%Y-%m-%dT%H:%M:%S.000000000Z"),
+                        "time": to_utc(tick.time).strftime(
+                            "%Y-%m-%dT%H:%M:%S.000000000Z"
+                        ),
                         "bids": [{"price": str(tick.bid)}],
                         "asks": [{"price": str(tick.ask)}],
                     }
@@ -527,6 +546,7 @@ class MT5Client:
             raise MT5Error(f"Cannot get price for {symbol}")
 
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+        deviation = self._compute_deviation(symbol, tick)
 
         # Build order request
         request = {
@@ -535,7 +555,7 @@ class MT5Client:
             "volume": volume,
             "type": order_type,
             "price": price,
-            "deviation": 20,  # Max slippage in points
+            "deviation": deviation,  # Max slippage in points
             "magic": 234000,  # Magic number to identify our bot's trades
             "comment": "TraderBot",
             "type_time": mt5.ORDER_TIME_GTC,
@@ -549,13 +569,35 @@ class MT5Client:
 
         logger.info(
             f"Placing market order: {symbol} {'BUY' if units > 0 else 'SELL'} "
-            f"{volume} lots | SL: {stop_loss_price} | TP: {take_profit_price}"
+            f"{volume} lots | SL: {stop_loss_price} | TP: {take_profit_price} | "
+            f"deviation={deviation}"
         )
 
         result = mt5.order_send(request)
 
         if result is None:
             raise MT5Error(f"Order send returned None: {mt5.last_error()}")
+
+        if result.retcode in RETRYABLE_RETCODES:
+            # Exactly one retry with a fresh price/deviation on transient
+            # requote / off-quotes / price-changed retcodes. Any other
+            # retcode (including a retry that fails again) hard-fails.
+            logger.warning(
+                f"Order retcode {result.retcode} ({result.comment}) for {symbol} "
+                f"is transient — retrying once with a fresh price."
+            )
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                raise MT5Error(f"Cannot get fresh price for retry on {symbol}")
+
+            price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+            request["price"] = price
+            request["deviation"] = self._compute_deviation(symbol, tick)
+
+            result = mt5.order_send(request)
+
+            if result is None:
+                raise MT5Error(f"Order retry send returned None: {mt5.last_error()}")
 
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             raise MT5Error(
@@ -568,16 +610,133 @@ class MT5Client:
             f"Deal: {result.deal} | Order: {result.order}"
         )
 
+        fill_price, fill_volume, fill_estimated = self._validate_fill(
+            symbol, volume, result, request_price=price
+        )
+
         # Return in OANDA-compatible format
         return {
             "orderFillTransaction": {
-                "price": str(result.price),
+                "price": str(fill_price),
                 "tradeOpened": {
                     "tradeID": str(result.order),
                 },
                 "id": str(result.deal),
+                "units": str(fill_volume),
+                "fill_price_estimated": fill_estimated,
             },
         }
+
+    def _compute_deviation(self, symbol: str, tick) -> int:
+        """
+        Compute max allowed slippage in points for an order.
+
+        `max(20, ceil(current_spread_points * 1.5))` — widens the
+        allowed deviation when the spread is already wide (fast markets,
+        news events) instead of hard-coding 20 points, which was too
+        tight during volatile conditions and too loose during calm ones.
+        """
+        try:
+            info = mt5.symbol_info(symbol)
+            point = info.point if info and info.point else None
+        except Exception:
+            point = None
+
+        if not point or tick is None:
+            return 20
+
+        try:
+            spread_price = tick.ask - tick.bid
+            spread_points = spread_price / point
+        except Exception:
+            return 20
+
+        return max(20, math.ceil(spread_points * 1.5))
+
+    def _validate_fill(
+        self,
+        symbol: str,
+        expected_volume: float,
+        result,
+        request_price: float,
+    ) -> tuple[float, float, bool]:
+        """
+        Validate that a DONE order_send result carries sane fill data.
+
+        MT5 should always populate `price` and `volume` on a filled
+        result, but if either is missing/zero (seen intermittently with
+        some brokers on partial fills or slow terminal updates), poll
+        positions for the ticket immediately — rather than waiting on the
+        60s reconcile loop — to synthesize/repair the fill data.
+
+        If the position poll also can't find the ticket, fall back to the
+        already-known pre-order request price (the tick ask/bid used to
+        build the order request) and the expected order volume — this is
+        an estimate, never a 0.0/negative placeholder, since a garbage
+        price would corrupt downstream trailing-SL and P&L math on a live
+        account. If even that request price is unavailable/invalid, raise
+        loudly rather than return unusable fill data.
+
+        Returns (fill_price, fill_volume, fill_price_estimated).
+        """
+        price = getattr(result, "price", None)
+        volume = getattr(result, "volume", None)
+
+        price_ok = price is not None and price > 0
+        volume_ok = volume is not None and volume > 0
+
+        if price_ok and volume_ok:
+            return price, volume, False
+
+        logger.warning(
+            f"Order result for {symbol} (order={getattr(result, 'order', None)}) missing/"
+            f"invalid fill fields (price={price}, volume={volume}) — polling positions "
+            f"for repair."
+        )
+
+        ticket = getattr(result, "order", None)
+        try:
+            positions = mt5.positions_get(ticket=ticket) if ticket else None
+        except Exception as e:
+            logger.error(f"Position poll for fill repair failed: {e}")
+            positions = None
+
+        if positions:
+            pos = positions[0]
+            repaired_price = pos.price_open if not price_ok else price
+            repaired_volume = pos.volume if not volume_ok else volume
+            logger.info(
+                f"Repaired fill for {symbol} ticket {ticket}: "
+                f"price={repaired_price}, volume={repaired_volume}"
+            )
+            return repaired_price, repaired_volume, False
+
+        # Could not repair via position poll — fall back to the known
+        # pre-order request price rather than emitting 0.0/negative,
+        # which would silently corrupt entry_price downstream.
+        fallback_price = price if price_ok else request_price
+        fallback_volume = volume if volume_ok else expected_volume
+
+        if fallback_price is None or fallback_price <= 0:
+            raise MT5Error(
+                f"Cannot determine a sane fill price for {symbol} ticket {ticket}: "
+                f"order result missing price, position poll found no match, and "
+                f"request price is unavailable/invalid ({fallback_price})."
+            )
+        if fallback_volume is None or fallback_volume <= 0:
+            raise MT5Error(
+                f"Cannot determine a sane fill volume for {symbol} ticket {ticket}: "
+                f"order result missing volume, position poll found no match, and "
+                f"expected volume is invalid ({fallback_volume})."
+            )
+
+        logger.warning(
+            f"Could not repair fill data for {symbol} ticket {ticket} — "
+            f"position not found. Falling back to pre-order request price "
+            f"({fallback_price}) and expected volume ({fallback_volume}); "
+            f"marking fill_price_estimated=True."
+        )
+        return fallback_price, fallback_volume, True
 
     def close_trade(self, trade_id: str, units: str = "ALL") -> dict:
         """
@@ -602,6 +761,7 @@ class MT5Client:
         close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
         tick = mt5.symbol_info_tick(symbol)
         price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+        deviation = self._compute_deviation(symbol, tick)
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -610,7 +770,7 @@ class MT5Client:
             "type": close_type,
             "position": ticket,
             "price": price,
-            "deviation": 20,
+            "deviation": deviation,
             "magic": 234000,
             "comment": "TraderBot close",
             "type_time": mt5.ORDER_TIME_GTC,
@@ -710,6 +870,18 @@ class MT5Client:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def invalidate_symbol_cache(self):
+        """
+        Clear the cached instrument -> MT5 symbol suffix mapping.
+
+        Called automatically on every connect()/reconnect. Also callable
+        directly (e.g. DataCollector._resync_symbols) to force the next
+        _to_mt5_symbol() call for each instrument to re-detect the suffix
+        against the broker, rather than reusing a mapping cached from
+        before a reconnect.
+        """
+        self._symbol_cache = {}
+
     def _to_mt5_symbol(self, instrument: str) -> str:
         """
         Convert our instrument format to MT5 symbol.
@@ -719,7 +891,17 @@ class MT5Client:
 
         Some brokers use different naming (e.g., "EURUSDm" for micro).
         We check if the symbol exists and try common suffixes.
+
+        The detected mapping is cached per instrument so repeated calls
+        don't re-probe the broker; the cache is invalidated on every
+        connect()/reconnect (see invalidate_symbol_cache()) so a broker
+        suffix change across a reconnect is picked up instead of sticking
+        with a stale mapping.
         """
+        cached = self._symbol_cache.get(instrument)
+        if cached is not None:
+            return cached
+
         # Direct conversion: remove underscore
         symbol = instrument.replace("_", "")
 
@@ -727,6 +909,7 @@ class MT5Client:
         info = mt5.symbol_info(symbol)
         if info is not None:
             mt5.symbol_select(symbol, True)
+            self._symbol_cache[instrument] = symbol
             return symbol
 
         # Try common broker suffixes
@@ -736,11 +919,13 @@ class MT5Client:
             if info is not None:
                 mt5.symbol_select(test, True)
                 logger.info(f"Symbol mapped: {instrument} → {test}")
+                self._symbol_cache[instrument] = test
                 return test
 
         # Fallback: return as-is and hope for the best
         logger.warning(f"Symbol {symbol} not found in MT5, using as-is")
         mt5.symbol_select(symbol, True)
+        self._symbol_cache[instrument] = symbol
         return symbol
 
     def _units_to_lots(self, symbol: str, units: int) -> float:
@@ -787,7 +972,7 @@ class MT5Client:
     def _parse_time(time_str: str) -> datetime:
         """Parse a time string to datetime."""
         if isinstance(time_str, datetime):
-            return time_str
+            return to_utc(time_str)
 
         # Handle various formats
         for fmt in [

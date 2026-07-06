@@ -219,9 +219,19 @@ class DataCollector:
         """
         Re-detect the instrument -> MT5 symbol suffix mapping after a
         reconnect (broker terminal state, e.g. Market Watch selections,
-        can reset on reconnect). Uses the existing detection function
-        on MT5Client until a dedicated cache exists.
+        can reset on reconnect).
+
+        MT5Client caches the detected suffix per instrument (see
+        MT5Client._symbol_cache), so a plain _to_mt5_symbol() call would
+        just return the stale cached value. invalidate_symbol_cache()
+        clears it first so the loop below forces a real re-probe of the
+        broker for every enabled instrument.
         """
+        try:
+            self.client.invalidate_symbol_cache()
+        except Exception as e:
+            logger.warning(f"Symbol cache invalidation failed: {e}")
+
         instruments = self.config.get_enabled_instruments()
         for instrument in instruments:
             try:
