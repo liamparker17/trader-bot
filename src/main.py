@@ -34,9 +34,6 @@ from src.growth.milestone_tracker import MilestoneTracker
 from src.monitoring.trade_journal import TradeJournal
 from src.monitoring.performance import PerformanceTracker
 from src.monitoring.telegram_bot import TelegramBot
-from src.ai.analyst import AIAnalyst
-from src.ai.shadow_trader import ShadowTrader
-from src.ai.approval_queue import ApprovalQueue
 from src.control.effective_config import EffectiveConfig
 from src.control.queue import ControlQueue
 
@@ -128,9 +125,6 @@ class TraderBot:
         self.journal = None
         self.performance = None
         self.telegram = None
-        self.analyst = None
-        self.shadow = None
-        self.approval_queue = None
         self.instance_lock = InstanceLock()
         self.daily_summary_scheduler = None
         self.effective_config = None
@@ -183,11 +177,6 @@ class TraderBot:
         self.performance = PerformanceTracker(self.journal)
         self.telegram = TelegramBot(self.config)
         self.daily_summary_scheduler = DailySummaryScheduler(self.config, self.journal)
-
-        # AI Analyst (optional Claude layer)
-        self.analyst = AIAnalyst(self.config)
-        self.approval_queue = ApprovalQueue(self.config)
-        self.shadow = ShadowTrader(self.config, self.analyst)
 
         # Data collector with candle callback
         self.collector = DataCollector(
@@ -283,35 +272,6 @@ class TraderBot:
             name="reconciliation",
         )
         recon_thread.start()
-
-        # Start Telegram command listener for /approve, /reject, /pending, /shadow
-        if self.telegram and self.approval_queue:
-            self.telegram.start_command_listener(
-                approval_queue=self.approval_queue,
-                shadow_trader=self.shadow,
-            )
-
-        # AI Analyst: pre-session briefing
-        if self.analyst.is_active:
-            try:
-                instruments = self.config.get_enabled_instruments()
-                balance = self.client.get_account_balance()
-                briefing = self.analyst.session_briefing(
-                    session="startup",
-                    instruments=instruments,
-                    market_data={},  # Will be populated once candles are available
-                    balance=balance,
-                )
-                if briefing:
-                    logger.info(f"AI Session Briefing: regime={briefing.get('regime', 'unknown')}")
-                    for inst, bias in briefing.get("bias", {}).items():
-                        logger.info(f"  {inst}: {bias}")
-                    self.telegram._send(
-                        f"<b>AI Briefing:</b> {briefing.get('regime', '?')} regime\n"
-                        + "\n".join(f"  {k}: {v}" for k, v in briefing.get("bias", {}).items())
-                    )
-            except Exception as e:
-                logger.debug(f"AI briefing skipped: {e}")
 
         last_status_log = 0
         last_balance_check = 0.0
@@ -479,11 +439,6 @@ class TraderBot:
         pip_location = inst_config.get("pip_location", -4) if inst_config else -4
         pip_size = 10 ** pip_location
 
-        # === Execute any user-approved Claude recommendations ===
-        current_price = float(m1_df.iloc[-1]["close"])
-        if self.approval_queue:
-            self._execute_approved_trades(instrument, current_price, features)
-
         # === PER-INSTRUMENT STRATEGY DISPATCH ===
         strategy = inst_config.get("strategy", "pullback") if inst_config else "pullback"
         direction = None
@@ -530,52 +485,6 @@ class TraderBot:
         atr_ratio = features.get("atr_ratio", 1.0)
         if atr_value <= 0:
             return
-
-        # --- AI Analyst review (optional) ---
-        if self.analyst.is_active:
-            try:
-                balance = self.client.get_account_balance()
-                daily_pnl = self.performance.get_summary().get("total_pnl", 0.0)
-                open_positions = [
-                    {"instrument": t.instrument, "direction": t.direction,
-                     "entry_price": t.entry_price, "unrealized_pnl": t.current_pnl}
-                    for t in self.executor.open_trades.values()
-                ] if self.executor.open_trades else []
-
-                review = self.analyst.review_trade(
-                    instrument=instrument,
-                    direction=direction,
-                    ml_confidence=ml_confidence,
-                    features=features,
-                    open_positions=open_positions,
-                    daily_pnl=daily_pnl,
-                    balance=balance,
-                    atr_value=atr_value,
-                    spread=spread,
-                )
-
-                if review["source"] == "ai_analyst":
-                    logger.info(
-                        f"AI Review: {'APPROVED' if review['approved'] else 'REJECTED'} "
-                        f"({review['confidence']:.0%}) — {review['reasoning']}"
-                    )
-                    if review.get("warnings"):
-                        for w in review["warnings"]:
-                            logger.warning(f"AI Warning: {w}")
-
-                    require_approval = self.config.get("ai_analyst.require_approval", False)
-                    if not review["approved"] and require_approval:
-                        logger.info(f"Trade BLOCKED by AI Analyst: {instrument} {direction}")
-                        return
-
-                    # Apply size modification if suggested
-                    size_mult = review.get("modifications", {}).get("reduce_size")
-                    if size_mult and isinstance(size_mult, (int, float)) and 0 < size_mult < 1:
-                        atr_ratio = atr_ratio * size_mult
-                        logger.info(f"AI Analyst reduced position size by {size_mult:.0%}")
-
-            except Exception as e:
-                logger.debug(f"AI review skipped: {e}")
 
         # Execute through the executor (which goes through risk manager)
         trade = self.executor.execute_signal(
@@ -883,118 +792,6 @@ class TraderBot:
             return rsi > rsi_os and bb_pos > 0.15 and divergence != 1
         return False
 
-    def _send_shadow_summary(self, result: dict):
-        """Send shadow retrospective results via Telegram."""
-        shadow_pnl = result.get("shadow_pnl_pips", 0)
-        bot_pnl = result.get("bot_pnl_pips", 0)
-        shadow_emoji = "\u2705" if shadow_pnl > 0 else "\U0001f534"
-        bot_emoji = "\u2705" if bot_pnl > 0 else "\U0001f534"
-
-        text = (
-            f"\U0001f9e0 <b>Claude Shadow Report — {result['date']}</b>\n\n"
-            f"<b>Claude's Trades (paper):</b>\n"
-            f"  Trades: {result['shadow_total']} "
-            f"({result['shadow_wins']}W / {result['shadow_losses']}L)\n"
-            f"  {shadow_emoji} PnL: {shadow_pnl:+.1f} pips\n\n"
-            f"<b>Bot's Actual Trades:</b>\n"
-            f"  Trades: {result['bot_trades']}\n"
-            f"  {bot_emoji} PnL: {bot_pnl:+.1f} pips\n\n"
-        )
-
-        diff = shadow_pnl - bot_pnl
-        if diff > 0:
-            text += f"\U0001f4a1 Claude was ahead by {diff:+.1f} pips today."
-        elif diff < 0:
-            text += f"\U0001f916 Bot was ahead by {abs(diff):.1f} pips today."
-        else:
-            text += "Dead even today."
-
-        # Show individual trades
-        trades = result.get("shadow_trades", [])
-        if trades:
-            text += "\n\n<b>Claude's Trades:</b>"
-            for t in trades[:5]:
-                pnl = t.get("pnl_pips", 0)
-                emoji = "\u2705" if pnl > 0 else "\u274c"
-                text += (
-                    f"\n{emoji} {t['instrument']} {t['direction'].upper()} "
-                    f"{pnl:+.1f} pips ({t.get('exit_reason', '?')})"
-                )
-
-        self.telegram._send(text)
-
-    def _execute_approved_trades(self, instrument: str, current_price: float, features: dict):
-        """Pick up user-approved Claude recommendations and execute them."""
-        try:
-            approved = self.approval_queue.get_approved_trades()
-            for trade in approved:
-                if trade.instrument != instrument:
-                    continue
-
-                # Check price hasn't moved too far from recommendation
-                inst_config = self.config.get_instrument(instrument)
-                pip_loc = inst_config.get("pip_location", -4) if inst_config else -4
-                pip_size = 10 ** pip_loc
-                max_slip = self.config.get("ai_analyst.approval_max_slippage_pips", 5)
-                slippage_pips = abs(current_price - trade.entry_price) / pip_size
-
-                if slippage_pips > max_slip:
-                    logger.info(
-                        f"Approved trade {trade.id} skipped: price moved "
-                        f"{slippage_pips:.1f} pips (max {max_slip})"
-                    )
-                    self.approval_queue.mark_executed(trade.id)
-                    continue
-
-                atr_value = features.get("atr_value", 0)
-                atr_ratio = features.get("atr_ratio", 1.0)
-                if atr_value <= 0:
-                    continue
-
-                logger.info(
-                    f"Executing approved Claude trade: {trade.id} | "
-                    f"{instrument} {trade.direction.upper()} | "
-                    f"Conf: {trade.confidence:.0%}"
-                )
-
-                result = self.executor.execute_signal(
-                    instrument=instrument,
-                    direction=trade.direction,
-                    ml_confidence=trade.confidence,
-                    atr_value=atr_value,
-                    atr_ratio=atr_ratio,
-                )
-
-                self.approval_queue.mark_executed(trade.id)
-
-                if result:
-                    self.journal.record_trade(
-                        trade_id=result.trade_id,
-                        instrument=result.instrument,
-                        direction=result.direction,
-                        units=result.units,
-                        entry_price=result.entry_price,
-                        entry_time=result.entry_time,
-                        stop_loss=result.stop_loss,
-                        take_profit=result.take_profit,
-                        ml_confidence=trade.confidence,
-                        model_version=f"claude_{trade.id}",
-                        trend_15min=int(features.get("trend_15min", 0)),
-                    )
-                    self.telegram.trade_opened(
-                        instrument=result.instrument,
-                        direction=result.direction,
-                        units=result.units,
-                        entry_price=result.entry_price,
-                        stop_loss=result.stop_loss,
-                        take_profit=result.take_profit,
-                        confidence=trade.confidence,
-                        risk_amount=result.risk_amount,
-                    )
-
-        except Exception as e:
-            logger.debug(f"Approved trade execution error: {e}")
-
     def _reconciliation_loop(self):
         """Background thread: sync with broker and check positions."""
         interval = self.config.get("monitoring.reconciliation_interval_seconds", 60)
@@ -1006,27 +803,6 @@ class TraderBot:
                 balance = self.client.get_account_balance()
                 self.milestones.check(balance)
                 self.growth.update(balance)
-
-                # End-of-day shadow retrospective
-                from datetime import datetime as dt_cls, timezone as tz_cls
-                hour_utc = dt_cls.now(tz_cls.utc).hour
-                if self.shadow and self.shadow.should_run(hour_utc):
-                    try:
-                        logger.info("Running end-of-day shadow retrospective...")
-                        result = self.shadow.run_retrospective(
-                            collector=self.collector,
-                            engine=self.engine,
-                            journal=self.journal,
-                            mt5_client=self.client,
-                        )
-                        if result and self.telegram:
-                            self._send_shadow_summary(result)
-                    except Exception as e:
-                        logger.error(f"Shadow retrospective failed: {e}", exc_info=True)
-
-                # Expire pending approvals
-                if self.approval_queue:
-                    self.approval_queue.expire_old()
 
                 # Check ML retrain triggers
                 should_retrain, reason = self.evaluator.should_retrain()
