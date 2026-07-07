@@ -581,3 +581,11 @@ class TestRunnerArgs:
         from backtest.runner import _parse_args
         with pytest.raises(SystemExit):
             _parse_args(["--manager", "random"])
+
+    def test_claude_without_api_key_exits_gracefully(self, monkeypatch, config):
+        import backtest.runner as runner_mod
+        # load_config() would re-read .env (which may set the key) and the
+        # data pipeline would kick off — stub it and scrub the env instead.
+        monkeypatch.setattr(runner_mod, "load_config", lambda: config)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        assert runner_mod.run_managed_backtest("claude") is None

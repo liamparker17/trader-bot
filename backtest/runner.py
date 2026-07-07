@@ -23,6 +23,7 @@ comparison table, manager decision log, API cost, and net-after-cost PnL.
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -326,7 +327,15 @@ def run_managed_backtest(backend: str, client=None):
         format_decision_log,
     )
 
-    config = load_config()
+    config = load_config()  # also loads .env (ANTHROPIC_API_KEY)
+
+    if backend == "claude" and client is None and not os.environ.get("ANTHROPIC_API_KEY"):
+        logger.error(
+            "--manager claude requires ANTHROPIC_API_KEY in the environment/.env. "
+            "Use --manager heuristic for an API-free run."
+        )
+        return None
+
     engine = IndicatorEngine(config)
     predictor = Predictor(config)
     if predictor.load_model():
