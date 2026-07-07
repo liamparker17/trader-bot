@@ -25,6 +25,7 @@ import argparse
 import logging
 import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -291,18 +292,37 @@ def run_backtest():
     return all_results[0] if len(all_results) == 1 else {"combined": all_results}
 
 
-def _managed_test_window(config, logger) -> dict:
-    """Same test slice as the baseline backtest (last 30% of M1 data)."""
+def _managed_test_window(config, logger, window_days: int = None) -> dict:
+    """
+    Test slice for the managed backtest. Default: the same last-30% M1
+    split as the baseline backtest. With `window_days`, instead take the
+    trailing N calendar days ending at the freshest cached M1 timestamp
+    across all instruments (one shared wall-clock window), still capped
+    to the last-30% test split so the saved model's training data (first
+    70%) is never replayed.
+    """
+    raw = _load_m1_m15_backtest_data(config, logger)
+    cutoff = None
+    if window_days is not None and raw:
+        latest = max(m1_df.index.max() for m1_df, _ in raw.values())
+        cutoff = latest - timedelta(days=window_days)
+        logger.info(f"Managed backtest window: last {window_days} days "
+                    f"({cutoff} -> {latest})")
     data = {}
-    for inst, (m1_df, m15_df) in _load_m1_m15_backtest_data(config, logger).items():
+    for inst, (m1_df, m15_df) in raw.items():
         inst_split = int(len(m1_df) * 0.7)
         m1_test = m1_df.iloc[inst_split:]
+        if cutoff is not None:
+            m1_test = m1_test[m1_test.index >= cutoff]
+        if m1_test.empty:
+            logger.warning(f"{inst}: no data in the requested window — skipped")
+            continue
         m15_test = m15_df[m15_df.index >= m1_test.index[0]]
         data[inst] = (m1_test, m15_test)
     return data
 
 
-def run_managed_backtest(backend: str, client=None):
+def run_managed_backtest(backend: str, client=None, window_days: int = None):
     """
     Managed backtest: baseline (no manager) vs managed over the same
     window, all instruments with cached data, R1000 starting balance.
@@ -344,7 +364,7 @@ def run_managed_backtest(backend: str, client=None):
         predictor.model = None
         logger.warning("No saved model available — running rules-only")
 
-    data = _managed_test_window(config, logger)
+    data = _managed_test_window(config, logger, window_days=window_days)
     if not data:
         logger.error("No M1/M15 backtest data found. Run: python -m src.main --fetch-data")
         return None
@@ -398,12 +418,22 @@ def _parse_args(argv=None):
             "(ANTHROPIC_API_KEY required)."
         ),
     )
+    parser.add_argument(
+        "--window-days",
+        type=int,
+        default=None,
+        help=(
+            "Restrict the managed backtest to the trailing N calendar days "
+            "of cached data (still capped to the last-30%% test split for "
+            "walk-forward hygiene)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = _parse_args()
     if args.manager:
-        run_managed_backtest(args.manager)
+        run_managed_backtest(args.manager, window_days=args.window_days)
     else:
         run_backtest()

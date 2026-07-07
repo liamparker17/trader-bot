@@ -614,3 +614,35 @@ class TestRunnerArgs:
         monkeypatch.setattr(runner_mod, "load_config", lambda: config)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         assert runner_mod.run_managed_backtest("claude") is None
+
+
+# ---------------------------------------------------------------------------
+# Task 16 support: --window-days trailing window selection
+# ---------------------------------------------------------------------------
+
+def test_managed_test_window_trailing_days(monkeypatch):
+    import pandas as pd
+    from datetime import datetime, timedelta, timezone
+    import backtest.runner as runner_module
+
+    end = datetime(2026, 3, 5, 19, 0, tzinfo=timezone.utc)
+    idx = pd.date_range(end=end, periods=30 * 24 * 60, freq="min", tz="UTC")
+    m1 = pd.DataFrame(
+        {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1},
+        index=idx,
+    )
+    m15 = m1.iloc[::15]
+
+    monkeypatch.setattr(
+        runner_module, "_load_m1_m15_backtest_data",
+        lambda config, logger: {"EUR_USD": (m1, m15)},
+    )
+    import logging as _logging
+    data = runner_module._managed_test_window(None, _logging.getLogger("t"), window_days=7)
+    m1_test, m15_test = data["EUR_USD"]
+    # Trailing 7 days only...
+    assert m1_test.index.min() >= end - timedelta(days=7)
+    assert m1_test.index.max() == end
+    # ...and still within the last-30% test split (no training-data replay).
+    split_start = m1.index[int(len(m1) * 0.7)]
+    assert m1_test.index.min() >= split_start
