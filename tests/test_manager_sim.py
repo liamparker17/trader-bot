@@ -475,6 +475,17 @@ class TestEndToEndSmoke:
         assert report["manager_decisions"] == []
         assert report["api_cost_zar"] == 0.0
 
+    def test_multi_instrument_shared_account(self, config, engine, predictor, tmp_path):
+        m1_eur, m15_eur = _make_synth_data(days=1, seed=7, base=1.10)
+        m1_gold, m15_gold = _make_synth_data(days=1, seed=11, base=2400.0)
+        ps = _portfolio(config, engine, predictor, tmp_path, manager=HeuristicManager())
+        report = ps.run({"EUR_USD": (m1_eur, m15_eur), "XAU_USD": (m1_gold, m15_gold)})
+        assert report["instruments"] == ["EUR_USD", "XAU_USD"]
+        assert set(report["per_instrument"]) == {"EUR_USD", "XAU_USD"}
+        # one shared account: single equity curve, one manager decision stream
+        assert len(report["equity_curve"]) > 0
+        assert report["manager_cycles"] > 0
+
     def test_comparison_table_renders(self, config, engine, predictor, tmp_path):
         m1, m15 = _make_synth_data(days=1)
         base = _portfolio(config, engine, predictor, tmp_path).run({"EUR_USD": (m1, m15)})
@@ -485,3 +496,88 @@ class TestEndToEndSmoke:
         assert "Baseline" in table and "Managed" in table
         assert "API cost (ZAR)" in table
         assert "Net PnL after cost" in table
+
+
+# ---------------------------------------------------------------- ClaudeManager (mocked)
+
+class _FakeToolBlock:
+    type = "tool_use"
+
+    def __init__(self, input_dict):
+        self.input = input_dict
+
+
+class _FakeUsage:
+    def __init__(self, input_tokens, output_tokens):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+
+class _FakeResponse:
+    def __init__(self, adjustments, rationale, input_tokens=1000, output_tokens=100):
+        self.content = [_FakeToolBlock({"adjustments": adjustments, "rationale": rationale})]
+        self.usage = _FakeUsage(input_tokens, output_tokens)
+
+
+class _FakeMessages:
+    def __init__(self, response):
+        self._response = response
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self._response
+
+
+class _FakeAnthropicClient:
+    def __init__(self, response):
+        self.messages = _FakeMessages(response)
+
+
+class TestClaudeManagerMocked:
+    """ClaudeManager with an injected fake client — never touches the network."""
+
+    def test_proposals_flow_through_clamp_and_cost_is_logged(
+        self, config, engine, predictor, tmp_path
+    ):
+        from backtest.manager_sim import ClaudeManager
+
+        response = _FakeResponse(
+            adjustments=[{"key": "weight.EUR_USD", "value": 2.0, "reason": "fake"}],
+            rationale="fake rationale",
+            input_tokens=2000,
+            output_tokens=200,
+        )
+        manager = ClaudeManager(config, client=_FakeAnthropicClient(response))
+        ps = _portfolio(config, engine, predictor, tmp_path, manager=manager)
+        state = SimState(balance=1000.0, starting_balance=1000.0)
+        decision = ps._run_manager_cycle(pd.Timestamp("2026-06-01 10:00"), state, equity=1000.0)
+
+        # out-of-bounds Claude proposal clamped by the shared policy gate
+        assert decision["applied"][0]["value"] == 1.5
+        assert decision["applied"][0]["clamped"] is True
+        assert ps.overlay.weight("EUR_USD") == 1.5
+        # cost accounted per cycle and accumulated
+        assert decision["cost_zar"] > 0.0
+        assert ps.api_cost_total == pytest.approx(decision["cost_zar"])
+        assert manager.total_cost_zar == pytest.approx(decision["cost_zar"])
+        # the briefing actually went to the (fake) API
+        assert len(manager._client.client.messages.calls) == 1
+
+
+# ---------------------------------------------------------------- runner CLI
+
+class TestRunnerArgs:
+    def test_default_is_baseline_pipeline(self):
+        from backtest.runner import _parse_args
+        assert _parse_args([]).manager is None
+
+    def test_manager_backends(self):
+        from backtest.runner import _parse_args
+        assert _parse_args(["--manager", "heuristic"]).manager == "heuristic"
+        assert _parse_args(["--manager", "claude"]).manager == "claude"
+
+    def test_unknown_backend_rejected(self):
+        from backtest.runner import _parse_args
+        with pytest.raises(SystemExit):
+            _parse_args(["--manager", "random"])

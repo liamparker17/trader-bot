@@ -2,16 +2,26 @@
 Backtest Runner — End-to-end script for training and backtesting.
 
 Usage:
-    python -m backtest.runner
+    python -m backtest.runner                       # baseline pipeline (unchanged)
+    python -m backtest.runner --manager heuristic   # managed vs baseline comparison, no API
+    python -m backtest.runner --manager claude      # managed via real Anthropic API
+                                                    #   (requires ANTHROPIC_API_KEY;
+                                                    #    ~10-13 calls per simulated day)
 
-Steps:
+Baseline steps (no --manager):
     1. Load M15 data (4 years) for all instruments -> ML training
     2. Load H1 data for trend bias during training
     3. Train XGBoost on combined multi-instrument M15 dataset
     4. Run backtest on M1 test data (last ~100 days)
     5. Print results
+
+Managed mode (--manager): skips (re)training — loads the latest saved
+model (rules-only if none), runs the multi-instrument PortfolioSimulator
+twice over the same test window (baseline, then managed), and prints the
+comparison table, manager decision log, API cost, and net-after-cost PnL.
 """
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -280,5 +290,111 @@ def run_backtest():
     return all_results[0] if len(all_results) == 1 else {"combined": all_results}
 
 
+def _managed_test_window(config, logger) -> dict:
+    """Same test slice as the baseline backtest (last 30% of M1 data)."""
+    data = {}
+    for inst, (m1_df, m15_df) in _load_m1_m15_backtest_data(config, logger).items():
+        inst_split = int(len(m1_df) * 0.7)
+        m1_test = m1_df.iloc[inst_split:]
+        m15_test = m15_df[m15_df.index >= m1_test.index[0]]
+        data[inst] = (m1_test, m15_test)
+    return data
+
+
+def run_managed_backtest(backend: str, client=None):
+    """
+    Managed backtest: baseline (no manager) vs managed over the same
+    window, all instruments with cached data, R1000 starting balance.
+
+    Args:
+        backend: "heuristic" (deterministic, no API) or "claude"
+                 (real Anthropic API via src.manager.client.ManagerClient).
+        client:  optional injected Anthropic-compatible client (tests).
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logger = logging.getLogger("backtest.runner")
+
+    from backtest.manager_sim import (
+        ClaudeManager,
+        HeuristicManager,
+        PortfolioSimulator,
+        comparison_table,
+        format_decision_log,
+    )
+
+    config = load_config()
+    engine = IndicatorEngine(config)
+    predictor = Predictor(config)
+    if predictor.load_model():
+        logger.info("Loaded latest saved model for managed backtest")
+    else:
+        predictor.model = None
+        logger.warning("No saved model available — running rules-only")
+
+    data = _managed_test_window(config, logger)
+    if not data:
+        logger.error("No M1/M15 backtest data found. Run: python -m src.main --fetch-data")
+        return None
+
+    logger.info("=" * 60)
+    logger.info("BASELINE (no manager) portfolio run...")
+    logger.info("=" * 60)
+    baseline = PortfolioSimulator(config, engine, predictor, manager=None).run(data)
+
+    if backend == "claude":
+        manager = ClaudeManager(config, client=client)
+    else:
+        manager = HeuristicManager()
+
+    logger.info("=" * 60)
+    logger.info(f"MANAGED ({backend}) portfolio run...")
+    logger.info("=" * 60)
+    managed = PortfolioSimulator(config, engine, predictor, manager=manager).run(data)
+
+    print()
+    print("=" * 60)
+    print(f"  BASELINE vs MANAGED ({backend})")
+    print("=" * 60)
+    print(comparison_table(baseline, managed))
+    print()
+    print(format_decision_log(managed))
+    print()
+    print(f"API cost total:       R{managed.get('api_cost_zar', 0.0):.2f}")
+    print(f"Net PnL after cost:   R{managed.get('net_pnl_after_cost_zar', 0.0):.2f}")
+    if managed.get("killed_by_floor"):
+        print(f"MANAGED RUN KILLED BY RATCHET FLOOR: {managed.get('kill_info')}")
+    if baseline.get("killed_by_floor"):
+        print(f"BASELINE RUN KILLED BY RATCHET FLOOR: {baseline.get('kill_info')}")
+
+    return {"baseline": baseline, "managed": managed}
+
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="python -m backtest.runner",
+        description="TraderBot backtest pipeline",
+    )
+    parser.add_argument(
+        "--manager",
+        choices=["heuristic", "claude"],
+        default=None,
+        help=(
+            "Run the managed (manager-in-the-loop) backtest and compare it "
+            "against a no-manager baseline. 'heuristic' is deterministic and "
+            "needs no API; 'claude' calls the real Anthropic API "
+            "(ANTHROPIC_API_KEY required)."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    run_backtest()
+    args = _parse_args()
+    if args.manager:
+        run_managed_backtest(args.manager)
+    else:
+        run_backtest()
