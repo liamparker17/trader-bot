@@ -24,6 +24,26 @@ from src.control.queue import ControlQueue
 from src.monitoring.trade_journal import TradeJournal
 
 
+class FakeDrawdownTracker:
+    """Minimal stand-in matching the DrawdownTracker surface queue.py uses."""
+
+    def __init__(self, daily_dd_pct: float, daily_limit: float = 0.04):
+        self._daily_dd_pct = daily_dd_pct
+        self.daily_limit = daily_limit
+
+    def get_daily_drawdown_pct(self, current_balance: float) -> float:
+        return self._daily_dd_pct
+
+
+class FakeClient:
+    def __init__(self, balance: float, equity: float = None):
+        self.balance = balance
+        self.equity = equity if equity is not None else balance
+
+    def get_account_summary(self):
+        return {"balance": self.balance, "equity": self.equity}
+
+
 class FakeRiskManager:
     """Minimal stand-in matching the RiskManager surface queue.py uses."""
 
@@ -32,6 +52,7 @@ class FakeRiskManager:
         self.entries_blocked = False
         self.open_position_count = 0
         self.ratchet_floor = None
+        self.drawdown = None
 
     @property
     def manual_paused(self) -> bool:
@@ -427,6 +448,33 @@ def test_status_snapshot_round_trip_no_control_log_row(tmp_path, monkeypatch):
     assert telegram.sent == []
 
 
+def test_status_snapshot_drawdown_vs_cap_populated(tmp_path, monkeypatch):
+    queue, journal, telegram, risk_manager, _ = _make_queue(tmp_path, monkeypatch)
+    risk_manager.drawdown = FakeDrawdownTracker(daily_dd_pct=0.02, daily_limit=0.04)
+    queue.client = FakeClient(balance=10_000)
+
+    _write_cmd(queue, "cmd1", "status_snapshot", reason="")
+    queue.poll_once()
+
+    result = _read_outbox(queue, "cmd1")
+    assert result["detail"]["balance"] == 10_000
+    # 0.02 daily drawdown vs a 0.04 cap -> halfway to the cap.
+    assert result["detail"]["drawdown_vs_cap"] == 0.5
+
+
+def test_status_snapshot_drawdown_vs_cap_null_when_balance_unknown(tmp_path, monkeypatch):
+    queue, journal, telegram, risk_manager, _ = _make_queue(tmp_path, monkeypatch)
+    risk_manager.drawdown = FakeDrawdownTracker(daily_dd_pct=0.02, daily_limit=0.04)
+    # No client wired in -> balance stays None -> drawdown_vs_cap must too.
+
+    _write_cmd(queue, "cmd1", "status_snapshot", reason="")
+    queue.poll_once()
+
+    result = _read_outbox(queue, "cmd1")
+    assert result["detail"]["balance"] is None
+    assert result["detail"]["drawdown_vs_cap"] is None
+
+
 # ---------------------------------------------------------------------------
 # atomicity
 # ---------------------------------------------------------------------------
@@ -514,3 +562,179 @@ def test_control_log_lifecycle_error_when_journal_lookup_raises(tmp_path, monkey
     assert result["outcome"] == "error"
     log = journal.get_control_log(verb="pause")
     assert log.iloc[0]["outcome"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# crash-replay idempotency (Task 8 review)
+# ---------------------------------------------------------------------------
+
+def test_replay_after_crash_does_not_reexecute(tmp_path, monkeypatch):
+    queue, journal, telegram, risk_manager, _ = _make_queue(tmp_path, monkeypatch)
+    cmd = {
+        "id": "replay1",
+        "verb": "tune",
+        "args": {"key": "risk.risk_per_trade_pct", "value": 2.0},
+        "reason": "first apply before the simulated crash",
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "requested_by": "operator",
+    }
+    inbox_path = queue.inbox_dir / "replay1.cmd.json"
+    inbox_path.write_text(json.dumps(cmd), encoding="utf-8")
+
+    queue.poll_once()
+
+    assert not inbox_path.exists()
+    result = _read_outbox(queue, "replay1")
+    assert result["outcome"] == "applied"
+    assert queue.effective_config.get("risk.risk_per_trade_pct") == 2.0
+
+    log_before = journal.get_control_log(verb="tune")
+    assert len(log_before) == 1
+
+    # Simulate a crash-replay: the CLI (or a bot restart) re-drops the
+    # exact same inbox file — e.g. the bot crashed between processing
+    # the command and unlinking the inbox file, or the CLI never saw
+    # the outbox result and retried.
+    (queue.outbox_dir / "replay1.result.json").unlink()
+    inbox_path.write_text(json.dumps(cmd), encoding="utf-8")
+
+    queue.poll_once()
+
+    # Not re-applied: still exactly one control_log row for this
+    # command (no double quota consumption of the manual-tune rate
+    # limit), and the inbox file was still cleaned up / outbox result
+    # still written.
+    log_after = journal.get_control_log(verb="tune")
+    assert len(log_after) == 1
+    assert not inbox_path.exists()
+    result2 = _read_outbox(queue, "replay1")
+    assert result2["outcome"] == "applied"
+    assert "replay" in result2["detail"].lower()
+
+
+def test_replay_of_rejected_command_stays_rejected(tmp_path, monkeypatch):
+    queue, journal, telegram, risk_manager, _ = _make_queue(tmp_path, monkeypatch)
+    cmd = {
+        "id": "replay_rej",
+        "verb": "tune",
+        "args": {"key": "risk.risk_per_trade_pct", "value": 99.0},
+        "reason": "out of bounds tune to be rejected",
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "requested_by": "operator",
+    }
+    inbox_path = queue.inbox_dir / "replay_rej.cmd.json"
+    inbox_path.write_text(json.dumps(cmd), encoding="utf-8")
+    queue.poll_once()
+    assert _read_outbox(queue, "replay_rej")["outcome"] == "rejected"
+
+    (queue.outbox_dir / "replay_rej.result.json").unlink()
+    inbox_path.write_text(json.dumps(cmd), encoding="utf-8")
+    queue.poll_once()
+
+    log = journal.get_control_log(verb="tune")
+    assert len(log) == 1
+    assert _read_outbox(queue, "replay_rej")["outcome"] == "rejected"
+
+
+# ---------------------------------------------------------------------------
+# cmd_id sanitization (Task 8 review)
+# ---------------------------------------------------------------------------
+
+def test_invalid_cmd_id_path_traversal_rejected(tmp_path, monkeypatch):
+    queue, journal, telegram, risk_manager, _ = _make_queue(tmp_path, monkeypatch)
+    cmd = {
+        "id": "../../etc/passwd",
+        "verb": "pause",
+        "args": {},
+        "reason": "attempting path traversal via the cmd id",
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "requested_by": "attacker",
+    }
+    # The filename itself must be a valid, safe inbox name to be picked
+    # up by glob at all — the malicious id lives inside the JSON payload
+    # (e.g. supplied by a compromised/buggy CLI writer).
+    inbox_path = queue.inbox_dir / "evil.cmd.json"
+    inbox_path.write_text(json.dumps(cmd), encoding="utf-8")
+
+    queue.poll_once()
+
+    assert not inbox_path.exists()
+    # Nothing escaped the outbox directory.
+    assert not (queue.outbox_dir.parent / "etc").exists()
+    outbox_files = list(queue.outbox_dir.glob("*.result.json"))
+    assert len(outbox_files) == 1
+    result = json.loads(outbox_files[0].read_text(encoding="utf-8"))
+    assert result["outcome"] == "rejected"
+    assert result["id"] != "../../etc/passwd"
+    assert risk_manager.manual_paused is False
+
+    log = journal.get_control_log()
+    assert len(log) == 1
+    assert log.iloc[0]["outcome"] == "rejected"
+
+
+def test_invalid_cmd_id_missing_falls_back_to_safe_id(tmp_path, monkeypatch):
+    queue, journal, telegram, risk_manager, _ = _make_queue(tmp_path, monkeypatch)
+    cmd = {
+        "verb": "pause",
+        "args": {},
+        "reason": "no id supplied and filename has weird chars",
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "requested_by": "tester",
+    }
+    # Even the filename-derived fallback id can be malformed if a writer
+    # used something other than the id for the filename stem.
+    inbox_path = queue.inbox_dir / "not a valid id!!.cmd.json"
+    inbox_path.write_text(json.dumps(cmd), encoding="utf-8")
+
+    queue.poll_once()
+
+    assert not inbox_path.exists()
+    outbox_files = list(queue.outbox_dir.glob("*.result.json"))
+    assert len(outbox_files) == 1
+    result = json.loads(outbox_files[0].read_text(encoding="utf-8"))
+    assert result["outcome"] == "rejected"
+    assert risk_manager.manual_paused is False
+
+
+# ---------------------------------------------------------------------------
+# poison-pill corrupt JSON -> deadletter (Task 8 review)
+# ---------------------------------------------------------------------------
+
+def test_corrupt_inbox_json_moved_to_deadletter_not_retried(tmp_path, monkeypatch):
+    queue, journal, telegram, risk_manager, _ = _make_queue(tmp_path, monkeypatch)
+    corrupt_path = queue.inbox_dir / "corrupt1.cmd.json"
+    corrupt_path.write_text('{"id": "corrupt1", "verb": "pause"', encoding="utf-8")  # truncated
+
+    processed = queue.poll_once()
+
+    assert processed == 0
+    assert not corrupt_path.exists()
+    dead_path = queue.deadletter_dir / "corrupt1.cmd.json.dead"
+    assert dead_path.exists()
+
+    # Not retried on the next poll — the file is gone from the inbox for
+    # good, so a poison pill can't warn (or fail) forever.
+    processed_again = queue.poll_once()
+    assert processed_again == 0
+    assert dead_path.exists()
+
+    # Best-effort outbox failure result was written using the id
+    # salvaged from the filename.
+    result = _read_outbox(queue, "corrupt1")
+    assert result["outcome"] == "error"
+
+
+def test_corrupt_inbox_json_only_warns_once(tmp_path, monkeypatch, caplog):
+    import logging
+    queue, journal, telegram, risk_manager, _ = _make_queue(tmp_path, monkeypatch)
+    corrupt_path = queue.inbox_dir / "corrupt2.cmd.json"
+    corrupt_path.write_text("not json at all", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="traderbot.control.queue"):
+        queue.poll_once()
+        queue.poll_once()
+        queue.poll_once()
+
+    deadletter_warnings = [r for r in caplog.records if "deadletter" in r.message]
+    assert len(deadletter_warnings) == 1

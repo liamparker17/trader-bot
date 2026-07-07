@@ -37,6 +37,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -48,6 +50,13 @@ logger = logging.getLogger("traderbot.control.queue")
 
 INBOX_DIR = PROJECT_ROOT / "control" / "inbox"
 OUTBOX_DIR = PROJECT_ROOT / "control" / "outbox"
+DEADLETTER_DIRNAME = "deadletter"
+
+# Sanitization for command ids taken from inbox JSON. Used to build the
+# outbox result path (`control/outbox/<id>.result.json`) and the
+# control_log `cmd_id` column — an unsanitized id is a path-traversal
+# vector (e.g. "../../etc/passwd") and a SQL-adjacent injection surface.
+CMD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # Manual tune rate limit: non-manager callers get 1 applied tune per
 # rolling window. `requested_by == "manager"` is exempt.
@@ -99,8 +108,10 @@ class ControlQueue:
 
         self.inbox_dir = inbox_dir or INBOX_DIR
         self.outbox_dir = outbox_dir or OUTBOX_DIR
+        self.deadletter_dir = self.inbox_dir.parent / DEADLETTER_DIRNAME
         self.inbox_dir.mkdir(parents=True, exist_ok=True)
         self.outbox_dir.mkdir(parents=True, exist_ok=True)
+        self.deadletter_dir.mkdir(parents=True, exist_ok=True)
 
         # Fallback manual-pause state used only when no risk_manager is
         # wired in (e.g. isolated unit tests of the queue itself).
@@ -130,23 +141,77 @@ class ControlQueue:
             try:
                 cmd = json.loads(path.read_text(encoding="utf-8"))
             except Exception as e:
-                logger.warning(f"Control queue: unreadable inbox file {path.name}: {e}")
+                # Poison pill: a corrupt/truncated inbox file would warn
+                # (and get skipped) on *every* poll forever if left in
+                # place. Move it out of the inbox so it's picked up
+                # exactly once, log a single WARNING, and best-effort
+                # notify the CLI via the outbox using whatever id can be
+                # salvaged from the filename.
+                self._deadletter(path, e)
                 continue
             entries.append((path, cmd))
 
         entries.sort(key=lambda pair: (pair[1].get("requested_at") or "", pair[0].name))
         return entries
 
+    def _deadletter(self, path: Path, error: Exception):
+        logger.warning(f"Control queue: unreadable inbox file {path.name}, moving to deadletter: {error}")
+
+        salvaged_id = path.name.split(".cmd.json")[0]
+        if CMD_ID_RE.match(salvaged_id):
+            try:
+                self._write_outbox(salvaged_id, {
+                    "id": salvaged_id,
+                    "outcome": "error",
+                    "detail": f"corrupt inbox command file: {error}",
+                    "applied_at": self.clock().isoformat(),
+                })
+            except Exception as e:
+                logger.error(f"Control queue: failed to write best-effort outbox result for corrupt file {path.name}: {e}")
+
+        dead_path = self.deadletter_dir / f"{path.name}.dead"
+        try:
+            os.replace(path, dead_path)
+        except OSError as e:
+            logger.error(f"Control queue: failed to move corrupt inbox file {path.name} to deadletter: {e}")
+
     # ------------------------------------------------------------------
     # Dispatch
     # ------------------------------------------------------------------
 
     def _process(self, path: Path, cmd: dict):
-        cmd_id = cmd.get("id") or path.name.split(".cmd.json")[0]
+        raw_id = cmd.get("id")
+        fallback_id = path.name.split(".cmd.json")[0]
+        candidate_id = raw_id if raw_id is not None else fallback_id
         verb = cmd.get("verb")
         args = cmd.get("args") or {}
         reason = cmd.get("reason") or ""
         requested_by = cmd.get("requested_by") or "unknown"
+
+        # cmd_id sanitization: it's used verbatim to build the outbox
+        # path (control/outbox/<id>.result.json) and the control_log
+        # cmd_id column — an unsanitized id (e.g. "../../etc/passwd") is
+        # a path-traversal vector. Reject loudly under a generated safe
+        # id instead of trusting attacker/writer-supplied input.
+        if not isinstance(candidate_id, str) or not CMD_ID_RE.match(candidate_id):
+            self._reject_invalid_id(path, candidate_id, verb, args, reason, requested_by)
+            return
+
+        cmd_id = candidate_id
+
+        # Crash-replay idempotency guard: if this cmd_id already reached
+        # a terminal outcome in control_log, this inbox file is a replay
+        # (e.g. re-dropped after a crash between the outbox write and
+        # the inbox unlink) — skip re-executing the verb entirely.
+        replay = self._replay_outcome(cmd_id)
+        if replay is not None:
+            outcome, detail = replay
+            logger.warning(
+                f"Control queue: replay detected for cmd_id={cmd_id!r} (already {outcome}); "
+                f"skipping re-execution"
+            )
+            self._finalize(path, cmd_id, outcome, detail)
+            return
 
         log_id = None
         before_json = None
@@ -161,7 +226,7 @@ class ControlQueue:
             else:
                 log_id = self.journal.log_control_command(
                     verb=verb, args=args, reason=reason, requested_by=requested_by,
-                    ts_utc=self.clock().isoformat(),
+                    ts_utc=self.clock().isoformat(), cmd_id=cmd_id,
                 )
                 self._notify(f"[control] received: {verb} args={args} reason={reason!r}")
 
@@ -182,22 +247,88 @@ class ControlQueue:
             outcome, detail = "error", str(e)
 
         if verb in VALID_VERBS and verb != "status_snapshot" and log_id is not None:
-            self.journal.update_control_outcome(
-                log_id, outcome, before_config_json=before_json, after_config_json=after_json,
-            )
+            try:
+                self.journal.update_control_outcome(
+                    log_id, outcome, before_config_json=before_json, after_config_json=after_json,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Control queue: failed to update control_log outcome for {cmd_id} ({verb}): {e}",
+                    exc_info=True,
+                )
             self._notify(f"[control] {outcome}: {verb} ({cmd_id}) — {detail}")
 
-        self._write_outbox(cmd_id, {
-            "id": cmd_id,
-            "outcome": outcome,
-            "detail": detail,
-            "applied_at": self.clock().isoformat(),
-        })
+        self._finalize(path, cmd_id, outcome, detail)
+
+    def _finalize(self, path: Path, cmd_id: str, outcome: str, detail):
+        """
+        Post-dispatch: write the outbox result, then delete the inbox
+        file last. If the outbox write fails, the inbox file is
+        deliberately left in place so the next poll retries it — and,
+        for a command that already reached control_log, the replay
+        guard in `_process` will skip re-executing the verb and simply
+        retry the outbox write, rather than double-applying it.
+        """
+        try:
+            self._write_outbox(cmd_id, {
+                "id": cmd_id,
+                "outcome": outcome,
+                "detail": detail,
+                "applied_at": self.clock().isoformat(),
+            })
+        except Exception as e:
+            logger.error(f"Control queue: failed to write outbox result for {cmd_id}: {e}", exc_info=True)
+            return
 
         try:
             path.unlink()
         except OSError as e:
-            logger.warning(f"Control queue: failed to remove processed inbox file {path.name}: {e}")
+            logger.error(f"Control queue: failed to remove processed inbox file {path.name}: {e}", exc_info=True)
+
+    def _replay_outcome(self, cmd_id: str) -> Optional[tuple[str, str]]:
+        """
+        Returns (outcome, detail) if `cmd_id` already has a terminal
+        (applied/rejected) row in control_log, else None. A pending row
+        (still mid-processing, shouldn't normally happen across polls
+        since processing is synchronous) is not treated as a replay.
+        """
+        if self.journal is None:
+            return None
+        try:
+            row = self.journal.get_control_log_by_cmd_id(cmd_id)
+        except Exception as e:
+            logger.warning(
+                f"Control queue: replay lookup failed for {cmd_id}, proceeding with normal processing: {e}"
+            )
+            return None
+        if row is None:
+            return None
+        outcome = row.get("outcome")
+        if outcome not in ("applied", "rejected"):
+            return None
+        return outcome, f"replay: command already processed (outcome={outcome})"
+
+    def _reject_invalid_id(self, path: Path, candidate_id, verb, args: dict, reason: str, requested_by: str):
+        safe_id = f"invalid-{uuid.uuid4().hex[:12]}"
+        logger.error(
+            f"Control queue: rejected inbox file {path.name} — invalid command id {candidate_id!r}; "
+            f"using generated id {safe_id} for the outbox/audit trail"
+        )
+
+        if self.journal is not None:
+            try:
+                log_id = self.journal.log_control_command(
+                    verb=verb or "unknown", args=args, reason=reason, requested_by=requested_by,
+                    ts_utc=self.clock().isoformat(), cmd_id=safe_id,
+                )
+                self.journal.update_control_outcome(log_id, "rejected")
+            except Exception as e:
+                logger.error(
+                    f"Control queue: failed to log rejected invalid-id command from {path.name}: {e}",
+                    exc_info=True,
+                )
+
+        self._finalize(path, safe_id, "rejected", f"invalid command id: {candidate_id!r}")
 
     def _notify(self, text: str):
         """Best-effort Telegram notification — never let it break command processing."""
@@ -443,6 +574,17 @@ class ControlQueue:
                 snapshot["equity"] = summary.get("equity")
         except Exception as e:
             logger.debug(f"status_snapshot: balance/equity unavailable: {e}")
+
+        try:
+            if self.risk_manager is not None and snapshot["balance"] is not None:
+                drawdown_tracker = getattr(self.risk_manager, "drawdown", None)
+                if drawdown_tracker is not None:
+                    daily_dd_pct = drawdown_tracker.get_daily_drawdown_pct(snapshot["balance"])
+                    cap_pct = getattr(drawdown_tracker, "daily_limit", None)
+                    if cap_pct:
+                        snapshot["drawdown_vs_cap"] = round(daily_dd_pct / cap_pct, 4)
+        except Exception as e:
+            logger.debug(f"status_snapshot: drawdown_vs_cap unavailable: {e}")
 
         try:
             if self.journal is not None:

@@ -114,7 +114,22 @@ class TradeJournal:
                 )
             """)
 
+            self._migrate_control_log_columns(conn)
+
         logger.info(f"Trade journal initialized: {self.db_path}")
+
+    def _migrate_control_log_columns(self, conn: sqlite3.Connection):
+        """
+        Idempotently add `cmd_id` to `control_log` for DBs created before
+        the crash-replay idempotency fix (Task 8 review). Guarded by
+        PRAGMA table_info so it's safe on every open, including
+        already-migrated (or brand-new) DBs. Used to detect an inbox
+        command that was already processed (e.g. re-dropped after a
+        crash) so it isn't re-executed.
+        """
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(control_log)").fetchall()}
+        if "cmd_id" not in existing:
+            conn.execute("ALTER TABLE control_log ADD COLUMN cmd_id TEXT")
 
     def _migrate_fee_columns(self, conn: sqlite3.Connection):
         """
@@ -296,6 +311,7 @@ class TradeJournal:
         reason: str = "",
         requested_by: str = "",
         ts_utc: str = None,
+        cmd_id: str = None,
     ) -> int:
         """
         Record an incoming control-queue (`tb` CLI) command as
@@ -305,20 +321,42 @@ class TradeJournal:
         `ts_utc` lets callers (ControlQueue, which has its own injectable
         clock for testing) supply the timestamp explicitly; defaults to
         wall-clock UTC now.
+
+        `cmd_id` is the sanitized inbox command id (see ControlQueue). It
+        lets a crash-replay of the same inbox file be recognized as
+        already-processed instead of re-executed (Task 8 review fix).
         """
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute("""
                 INSERT INTO control_log
-                (ts_utc, verb, args_json, reason, requested_by, outcome)
-                VALUES (?, ?, ?, ?, ?, 'pending')
+                (ts_utc, verb, args_json, reason, requested_by, outcome, cmd_id)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?)
             """, (
                 ts_utc or datetime.now(timezone.utc).isoformat(),
                 verb,
                 json.dumps(args) if args else None,
                 reason,
                 requested_by,
+                cmd_id,
             ))
             return cur.lastrowid
+
+    def get_control_log_by_cmd_id(self, cmd_id: str) -> Optional[dict]:
+        """
+        Look up the most recent control_log row for a given `cmd_id`, if
+        any. Used by ControlQueue's replay guard: if a command with this
+        id was already recorded as applied/rejected, a re-dropped inbox
+        file (e.g. after a crash between outbox-write and inbox-unlink)
+        must not be re-executed.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT * FROM control_log WHERE cmd_id = ? ORDER BY id DESC LIMIT 1",
+                (cmd_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row is not None else None
 
     def update_control_outcome(
         self,
