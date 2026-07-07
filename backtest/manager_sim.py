@@ -778,8 +778,10 @@ class PortfolioSimulator:
             peak = equity_df["equity"].expanding().max()
             drawdown = (equity_df["equity"] - peak) / peak
             max_drawdown = abs(drawdown.min())
+            max_drawdown_zar = float((peak - equity_df["equity"]).max())
         else:
             max_drawdown = 0.0
+            max_drawdown_zar = 0.0
 
         per_instrument = {}
         for inst in self._instruments:
@@ -807,6 +809,7 @@ class PortfolioSimulator:
             "final_balance": state.balance,
             "return_pct": (state.balance - state.starting_balance) / state.starting_balance * 100,
             "max_drawdown_pct": max_drawdown * 100,
+            "max_drawdown_zar": round(max_drawdown_zar, 2),
             "killed_by_floor": killed,
             "kill_info": kill_info,
             "ml_skips": getattr(state, "ml_skips", 0),
@@ -835,6 +838,77 @@ class PortfolioSimulator:
                 for t in trades
             ],
         }
+
+
+def run_managed_backtest_for_prompt(
+    backend: str,
+    prompt_path,
+    window_days: int,
+    client=None,
+    data: Optional[dict] = None,
+) -> dict:
+    """
+    Adapter for backtest/prompt_lab.py (Task 18): run ONE managed backtest
+    with the given system-prompt file over the last `window_days` days of
+    the cached test window.
+
+    Returns {trades, net_pnl_zar (NET of API cost), max_dd_zar,
+    api_cost_zar, report} — the keys prompt_lab.score_result expects.
+
+    Args:
+        backend:     "claude" (prompt_path becomes the manager's system
+                     prompt; needs ANTHROPIC_API_KEY unless `client` is
+                     injected) or "heuristic" (prompt ignored — harness
+                     smoke only).
+        prompt_path: path to the prompt variant file.
+        window_days: trailing window (days) of the test data to use;
+                     0/None = the full test window.
+        client:      optional injected Anthropic-compatible client (tests).
+        data:        optional {instrument: (m1_df, m15_df)} override; when
+                     None the standard cached test window is loaded.
+    """
+    from src.config import load_config
+    from src.indicators.engine import IndicatorEngine
+    from src.ml.predictor import Predictor
+
+    config = load_config()
+    engine = IndicatorEngine(config)
+    predictor = Predictor(config)
+    if not predictor.load_model():
+        predictor.model = None
+        logger.warning("prompt-lab backtest: no saved model — rules-only")
+
+    if data is None:
+        from backtest.runner import _managed_test_window  # lazy: avoid import cycle
+        data = _managed_test_window(config, logger)
+    if not data:
+        raise RuntimeError("No cached backtest data under data/historical/")
+
+    if window_days:
+        trimmed = {}
+        for inst, (m1_df, m15_df) in data.items():
+            cutoff = m1_df.index[-1] - pd.Timedelta(days=window_days)
+            m1_w = m1_df[m1_df.index > cutoff]
+            m15_w = m15_df[m15_df.index > cutoff]
+            if len(m1_w):
+                trimmed[inst] = (m1_w, m15_w)
+        data = trimmed
+
+    if backend == "claude":
+        manager = ClaudeManager(config, client=client)
+        # Override the champion prompt with this specific variant.
+        manager._client.system_prompt = Path(prompt_path).read_text(encoding="utf-8")
+    else:
+        manager = HeuristicManager()
+
+    report = PortfolioSimulator(config, engine, predictor, manager=manager).run(data)
+    return {
+        "trades": report.get("total_trades", 0),
+        "net_pnl_zar": report.get("net_pnl_after_cost_zar", 0.0),
+        "max_dd_zar": report.get("max_drawdown_zar", 0.0),
+        "api_cost_zar": report.get("api_cost_zar", 0.0),
+        "report": report,
+    }
 
 
 def comparison_table(baseline: dict, managed: dict) -> str:

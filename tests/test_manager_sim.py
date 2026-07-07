@@ -565,6 +565,31 @@ class TestClaudeManagerMocked:
         assert len(manager._client.client.messages.calls) == 1
 
 
+# ---------------------------------------------------------------- prompt-lab adapter
+
+class TestPromptLabAdapter:
+    def test_heuristic_adapter_returns_prompt_lab_schema(self, tmp_path):
+        from backtest.manager_sim import run_managed_backtest_for_prompt
+
+        prompt = tmp_path / "v001.md"
+        prompt.write_text("ignored by heuristic backend", encoding="utf-8")
+        m1, m15 = _make_synth_data(days=2)
+        result = run_managed_backtest_for_prompt(
+            backend="heuristic",
+            prompt_path=prompt,
+            window_days=1,
+            data={"EUR_USD": (m1, m15)},
+        )
+        assert set(result) >= {"trades", "net_pnl_zar", "max_dd_zar", "api_cost_zar"}
+        assert result["api_cost_zar"] == 0.0
+        assert result["max_dd_zar"] >= 0.0
+        # window trimming: only the trailing day of the 2-day set survives
+        curve = result["report"]["equity_curve"]
+        assert pd.Timestamp(curve[0]["time"]) > m1.index[0]
+        # score math inputs are plain floats (JSONL-serializable)
+        assert isinstance(result["net_pnl_zar"], float)
+
+
 # ---------------------------------------------------------------- runner CLI
 
 class TestRunnerArgs:
