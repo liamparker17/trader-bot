@@ -217,41 +217,59 @@ class ManagerRunner:
         try:
             proposals, rationale, usage = self.client.call(briefing)
         except ManagerAPIUnavailable as e:
+            # A billed-but-unusable response (e.g. no tool_use block)
+            # carries its usage on the exception — record the cost so the
+            # budget governor still sees it.
             self._log_and_alert(
                 trigger=trigger, outcome="api_unavailable", briefing=briefing,
                 rationale=f"API unavailable: {e}", now=now,
+                usage=getattr(e, "usage", None),
             )
             return
 
-        milestones = effective_config.get("growth.milestones", [1500, 2000, 3000, 4500, 6000])
-        ceiling = policy.risk_ceiling_now(balance, milestones)
-        applied, rejected = policy.validate_and_clamp(proposals, effective_config, ceiling)
+        # From here on the API cost has been incurred. Any failure below
+        # must still write a manager_log row carrying that cost — the only
+        # accepted loss window is a process crash before the log write.
+        try:
+            milestones = effective_config.get("growth.milestones", [1500, 2000, 3000, 4500, 6000])
+            ceiling = policy.risk_ceiling_now(balance, milestones)
+            applied, rejected = policy.validate_and_clamp(proposals, effective_config, ceiling)
 
-        reason_by_key = {p.get("key"): p.get("reason", "") for p in proposals if isinstance(p, dict)}
-        for entry in applied:
-            _enqueue_tune(
-                self.inbox_dir,
-                key=entry["key"],
-                value=entry["value"],
-                reason=reason_by_key.get(entry["key"], entry.get("reason", "")),
+            reason_by_key = {p.get("key"): p.get("reason", "") for p in proposals if isinstance(p, dict)}
+            for entry in applied:
+                _enqueue_tune(
+                    self.inbox_dir,
+                    key=entry["key"],
+                    value=entry["value"],
+                    reason=reason_by_key.get(entry["key"], entry.get("reason", "")),
+                )
+
+            outcome = "applied" if applied else "no_op"
+            model_name = getattr(self.client, "model", self.config.get("manager.model", ""))
+            self.journal.log_manager_cycle(
+                trigger=trigger,
+                briefing=briefing,
+                model=model_name,
+                input_tokens=usage.get("input_tokens"),
+                output_tokens=usage.get("output_tokens"),
+                cost_zar=usage.get("cost_zar"),
+                rationale=rationale,
+                proposals=proposals,
+                applied=applied,
+                rejected=rejected,
+                outcome=outcome,
+                ts_utc=now.isoformat(),
             )
-
-        outcome = "applied" if applied else "no_op"
-        model_name = getattr(self.client, "model", self.config.get("manager.model", ""))
-        self.journal.log_manager_cycle(
-            trigger=trigger,
-            briefing=briefing,
-            model=model_name,
-            input_tokens=usage.get("input_tokens"),
-            output_tokens=usage.get("output_tokens"),
-            cost_zar=usage.get("cost_zar"),
-            rationale=rationale,
-            proposals=proposals,
-            applied=applied,
-            rejected=rejected,
-            outcome=outcome,
-            ts_utc=now.isoformat(),
-        )
+        except Exception as e:
+            logger.error(
+                f"manager runner: post-API failure (cost_zar={usage.get('cost_zar')}): {e}",
+                exc_info=True,
+            )
+            self._log_and_alert(
+                trigger=trigger, outcome="error", briefing=briefing,
+                rationale=f"post-API failure: {e}", now=now, usage=usage,
+            )
+            return
 
         clamped_count = sum(1 for a in applied if a.get("clamped"))
         summary = (
@@ -267,11 +285,26 @@ class ManagerRunner:
         rationale: str,
         now: datetime,
         briefing: Optional[dict] = None,
+        usage: Optional[dict] = None,
     ) -> None:
-        self.journal.log_manager_cycle(
-            trigger=trigger, briefing=briefing, rationale=rationale,
-            outcome=outcome, ts_utc=now.isoformat(),
-        )
+        usage = usage or {}
+        try:
+            self.journal.log_manager_cycle(
+                trigger=trigger, briefing=briefing, rationale=rationale,
+                input_tokens=usage.get("input_tokens"),
+                output_tokens=usage.get("output_tokens"),
+                cost_zar=usage.get("cost_zar"),
+                outcome=outcome, ts_utc=now.isoformat(),
+            )
+        except Exception:
+            # Last-resort: the cost figure must at least land in the logs
+            # so budget accounting can be reconciled by hand.
+            logger.critical(
+                f"manager runner: FAILED to write manager_log row "
+                f"(outcome={outcome}, cost_zar={usage.get('cost_zar')}) — "
+                f"API cost may be missing from budget accounting",
+                exc_info=True,
+            )
         self._safe_telegram(f"[MANAGER] cycle ({trigger}): {outcome} — {rationale}")
 
     def _safe_telegram(self, summary: str) -> None:

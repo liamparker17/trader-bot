@@ -286,3 +286,109 @@ def test_run_forever_survives_repeated_errors(tmp_path):
         runner.run_forever(sleep_fn=sleep_fn, poll_interval_seconds=0)
 
     assert calls["n"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Fix round: API cost must never be silently lost on post-call error paths
+# ---------------------------------------------------------------------------
+
+def test_post_api_failure_still_logs_cost(tmp_path, monkeypatch):
+    """client.call succeeded (cost incurred) but enqueue blows up — the
+    error row must still carry the cycle's token/cost usage."""
+    import src.manager.runner as runner_module
+
+    client = FakeClient(
+        proposals=[{"key": "risk.risk_per_trade_pct", "value": 1.2, "reason": "r"}],
+        rationale="will fail downstream",
+    )
+    runner, journal, telegram, inbox_dir, outbox_dir, scheduler = _runner(tmp_path, client)
+
+    def exploding_enqueue(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runner_module, "_enqueue_tune", exploding_enqueue)
+
+    runner.run_once()  # must not raise
+
+    df = journal.get_manager_log()
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["outcome"] == "error"
+    assert row["cost_zar"] == pytest.approx(2.5)
+    assert row["input_tokens"] == 100
+    assert row["output_tokens"] == 50
+
+
+def test_api_unavailable_with_billed_response_logs_cost(tmp_path):
+    """A billed response with no usable tool_use block raises
+    ManagerAPIUnavailable carrying .usage — the log row must record it."""
+    exc = ManagerAPIUnavailable("no tool_use block")
+    exc.usage = {"input_tokens": 80, "output_tokens": 10, "cost_zar": 1.7}
+    client = FakeClient(exc=exc)
+    runner, journal, telegram, inbox_dir, outbox_dir, scheduler = _runner(tmp_path, client)
+
+    runner.run_once()
+
+    df = journal.get_manager_log()
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["outcome"] == "api_unavailable"
+    assert row["cost_zar"] == pytest.approx(1.7)
+
+
+def test_journal_write_failure_is_loud_but_never_raises(tmp_path, caplog):
+    """If even the manager_log write fails, the loop must survive and the
+    cost figure must land in a CRITICAL log line (recoverable from logs)."""
+    import logging as _logging
+
+    client = FakeClient(
+        proposals=[], rationale="ok",
+        usage={"input_tokens": 100, "output_tokens": 50, "cost_zar": 2.5},
+    )
+    runner, journal, telegram, inbox_dir, outbox_dir, scheduler = _runner(tmp_path, client)
+
+    def exploding_log(*args, **kwargs):
+        raise RuntimeError("db locked")
+
+    journal.log_manager_cycle = exploding_log
+
+    with caplog.at_level(_logging.CRITICAL, logger="traderbot.manager.runner"):
+        runner.run_once()  # must not raise
+
+    assert any("2.5" in rec.message or "cost" in rec.message.lower()
+               for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Fix round: manager.enabled=false must prevent cycles end-to-end
+# ---------------------------------------------------------------------------
+
+def test_disabled_manager_runs_no_cycles(tmp_path):
+    config = Config(settings={
+        "manager": {"enabled": False, "model": "claude-opus-4-8", "usd_zar_rate": 18.0},
+        "risk": {"session_boundary_hour_utc": 21},
+        "growth": {"milestones": [1500, 2000, 3000, 4500, 6000]},
+        "monitoring": {"trade_journal_db": str(tmp_path / "trades.db")},
+        "account": {"starting_balance_zar": 1000},
+        "trading": {"trading_sessions": {"forex": {"start_hour": 0, "end_hour": 24}}},
+    })
+    journal = TradeJournal(config)
+    client = FakeClient(proposals=[{"key": "risk.risk_per_trade_pct", "value": 1.2, "reason": "r"}])
+    scheduler = ManagerScheduler(
+        config=config, journal=journal, telegram=None,
+        now_fn=lambda: datetime(2026, 7, 7, 10, 0, tzinfo=timezone.utc),
+        events_dir=tmp_path / "control" / "manager_events",
+    )
+    runner = ManagerRunner(
+        config=config, journal=journal, client=client, scheduler=scheduler,
+        telegram=FakeTelegram(),
+        inbox_dir=tmp_path / "control" / "inbox",
+        outbox_dir=tmp_path / "control" / "outbox",
+        effective_config=_effective_config(),
+        balance_equity_fn=lambda: (1000.0, 1000.0),
+    )
+
+    runner.run_once()
+
+    assert client.calls == []
+    assert journal.get_manager_log().empty

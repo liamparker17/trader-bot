@@ -268,3 +268,173 @@ def test_budget_governor_normal_interval_when_budget_healthy(tmp_path):
     )
     interval = scheduler.next_interval_minutes(now)
     assert interval == pytest.approx(config.get("manager.cycle_minutes"))
+
+
+# ---------------------------------------------------------------------------
+# Fix round: manager.enabled flag
+# ---------------------------------------------------------------------------
+
+def test_disabled_manager_never_fires_and_leaves_events_untouched(tmp_path):
+    config = _config(tmp_path, enabled=False)
+    journal = _journal(tmp_path, config)
+    events_dir = tmp_path / "control" / "manager_events"
+    events_dir.mkdir(parents=True)
+    (events_dir / "e1.json").write_text(json.dumps({"type": "drawdown"}), encoding="utf-8")
+    scheduler = ManagerScheduler(
+        config=config, journal=journal, telegram=FakeTelegram(),
+        now_fn=lambda: datetime(2026, 7, 7, 10, 0, tzinfo=timezone.utc),
+        events_dir=events_dir,
+    )
+
+    fire, trigger, reason = scheduler.should_fire()
+    assert fire is False
+    assert reason == "disabled"
+    # Event file must NOT be consumed while disabled.
+    assert len(list(events_dir.glob("*.json"))) == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix round: min-gap persistence across restart
+# ---------------------------------------------------------------------------
+
+def test_min_gap_persists_across_restart_from_manager_log(tmp_path):
+    now = datetime(2026, 7, 7, 10, 0, tzinfo=timezone.utc)
+    config = _config(tmp_path)
+    journal = _journal(tmp_path, config)
+    # A cycle ran 5 minutes ago (recorded by a previous process run).
+    journal.log_manager_cycle(
+        trigger="timer", outcome="no_op",
+        ts_utc=(now - timedelta(minutes=5)).isoformat(),
+    )
+
+    events_dir = tmp_path / "control" / "manager_events"
+    events_dir.mkdir(parents=True)
+    (events_dir / "e1.json").write_text(json.dumps({"type": "drawdown"}), encoding="utf-8")
+
+    # Fresh scheduler == process restart. Must seed min-gap from manager_log.
+    scheduler = ManagerScheduler(
+        config=config, journal=journal, telegram=FakeTelegram(),
+        now_fn=lambda: now, events_dir=events_dir,
+    )
+    fire, trigger, reason = scheduler.should_fire()
+    assert fire is False
+    assert reason == "min_gap"
+
+
+def test_restart_with_old_manager_log_row_does_not_block(tmp_path):
+    now = datetime(2026, 7, 7, 10, 0, tzinfo=timezone.utc)
+    config = _config(tmp_path)
+    journal = _journal(tmp_path, config)
+    journal.log_manager_cycle(
+        trigger="timer", outcome="no_op",
+        ts_utc=(now - timedelta(hours=3)).isoformat(),
+    )
+    events_dir = tmp_path / "control" / "manager_events"
+    events_dir.mkdir(parents=True)
+    (events_dir / "e1.json").write_text(json.dumps({"type": "drawdown"}), encoding="utf-8")
+
+    scheduler = ManagerScheduler(
+        config=config, journal=journal, telegram=FakeTelegram(),
+        now_fn=lambda: now, events_dir=events_dir,
+    )
+    fire, trigger, reason = scheduler.should_fire()
+    assert fire is True
+    assert trigger == "drawdown"
+
+
+# ---------------------------------------------------------------------------
+# Fix round: boundary key precedence
+# ---------------------------------------------------------------------------
+
+def test_boundary_honors_trading_session_reset_hour_first(tmp_path):
+    config = _config(tmp_path)
+    config.settings["trading"]["session_reset_hour_utc"] = 5
+    config.settings["risk"]["session_boundary_hour_utc"] = 21
+    journal = _journal(tmp_path, config)
+    scheduler = ManagerScheduler(
+        config=config, journal=journal, telegram=FakeTelegram(),
+        now_fn=lambda: datetime(2026, 7, 7, 10, 0, tzinfo=timezone.utc),
+        events_dir=tmp_path / "control" / "manager_events",
+    )
+    assert scheduler.session_boundary_hour == 5
+
+
+def test_boundary_falls_back_to_risk_key_then_21(tmp_path):
+    config = _config(tmp_path)
+    config.settings["risk"]["session_boundary_hour_utc"] = 7
+    journal = _journal(tmp_path, config)
+    scheduler = ManagerScheduler(
+        config=config, journal=journal, telegram=FakeTelegram(),
+        now_fn=lambda: datetime(2026, 7, 7, 10, 0, tzinfo=timezone.utc),
+        events_dir=tmp_path / "control" / "manager_events",
+    )
+    assert scheduler.session_boundary_hour == 7
+
+    config2 = _config(tmp_path)
+    config2.settings["risk"].pop("session_boundary_hour_utc", None)
+    journal2 = _journal(tmp_path, config2)
+    scheduler2 = ManagerScheduler(
+        config=config2, journal=journal2, telegram=FakeTelegram(),
+        now_fn=lambda: datetime(2026, 7, 7, 10, 0, tzinfo=timezone.utc),
+        events_dir=tmp_path / "control" / "manager_events",
+    )
+    assert scheduler2.session_boundary_hour == 21
+
+
+# ---------------------------------------------------------------------------
+# Fix round: event deferral (min-gap) vs intentional drop (daily cap)
+# ---------------------------------------------------------------------------
+
+def test_event_during_min_gap_is_deferred_not_lost(tmp_path):
+    now_fn, advance = _clock(datetime(2026, 7, 7, 10, 0, tzinfo=timezone.utc))
+    scheduler, journal, events_dir = _scheduler(tmp_path, now_fn=now_fn)
+    events_dir.mkdir(parents=True)
+    (events_dir / "e1.json").write_text(json.dumps({"type": "drawdown"}), encoding="utf-8")
+
+    fire, trigger, _ = scheduler.should_fire()
+    assert fire is True
+    scheduler.record_cycle(now_fn())
+
+    # Event arrives 5 minutes later — inside the 20-minute min-gap.
+    advance(minutes=5)
+    (events_dir / "e2.json").write_text(
+        json.dumps({"type": "circuit_breaker"}), encoding="utf-8")
+    fire2, _, reason2 = scheduler.should_fire()
+    assert fire2 is False
+    assert reason2 == "min_gap"
+
+    # Once the gap expires, the deferred event fires WITHOUT a new file.
+    advance(minutes=16)
+    fire3, trigger3, reason3 = scheduler.should_fire()
+    assert fire3 is True
+    assert trigger3 == "circuit_breaker"
+    assert reason3 == "event"
+
+
+def test_events_at_daily_cap_are_dropped_with_log(tmp_path, caplog):
+    import logging as _logging
+    now = datetime(2026, 7, 7, 10, 0, tzinfo=timezone.utc)
+    config = _config(tmp_path, max_cycles_per_day=1)
+    journal = _journal(tmp_path, config)
+    journal.log_manager_cycle(trigger="timer", outcome="no_op", ts_utc=now.isoformat())
+    events_dir = tmp_path / "control" / "manager_events"
+    events_dir.mkdir(parents=True)
+    (events_dir / "e1.json").write_text(json.dumps({"type": "drawdown"}), encoding="utf-8")
+
+    scheduler = ManagerScheduler(
+        config=config, journal=journal, telegram=FakeTelegram(),
+        now_fn=lambda: now, events_dir=events_dir,
+    )
+    # Bypass min-gap seeding effect for this test: the logged row is "now",
+    # so use a scheduler whose min-gap is zero to isolate the cap behavior.
+    scheduler.min_gap_minutes = 0
+
+    with caplog.at_level(_logging.INFO, logger="traderbot.manager.scheduler"):
+        fire, trigger, reason = scheduler.should_fire()
+    assert fire is False
+    assert reason == "daily_cap_exceeded"
+    # Intentional, logged drop — not a silent loss.
+    assert any("dropp" in rec.message.lower() for rec in caplog.records)
+    # And the buffer is actually cleared (no ghost fire after cap resets... same day).
+    fire2, _, reason2 = scheduler.should_fire()
+    assert fire2 is False

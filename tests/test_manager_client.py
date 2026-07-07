@@ -208,3 +208,32 @@ def test_call_wraps_typed_exceptions_in_manager_api_unavailable(tmp_path, exc_fa
     manager_client = ManagerClient(_config(), client=fake_client, prompts_dir=tmp_path)
     with pytest.raises(ManagerAPIUnavailable):
         manager_client.call({"balance": 1000})
+
+
+# ---------------------------------------------------------------------------
+# Fix round: prompt loading behavior pinned down
+# ---------------------------------------------------------------------------
+
+def test_champion_beats_higher_version(tmp_path):
+    (tmp_path / "v001.md").write_text("ONE", encoding="utf-8")
+    (tmp_path / "v002.md").write_text("TWO", encoding="utf-8")
+    (tmp_path / "champion.txt").write_text("v001.md\n", encoding="utf-8")
+    # champion.txt wins even when a higher version exists.
+    assert load_champion_prompt(tmp_path) == "ONE"
+
+
+def test_empty_champion_falls_back_to_highest_version(tmp_path):
+    (tmp_path / "v001.md").write_text("ONE", encoding="utf-8")
+    (tmp_path / "v002.md").write_text("TWO", encoding="utf-8")
+    (tmp_path / "champion.txt").write_text("", encoding="utf-8")
+    assert load_champion_prompt(tmp_path) == "TWO"
+
+
+def test_repo_champion_txt_names_an_existing_prompt():
+    """The shipped champion.txt must explicitly name a real prompt file —
+    live behavior must not depend on the silent fallback path."""
+    from src.manager.client import PROMPTS_DIR
+
+    name = (PROMPTS_DIR / "champion.txt").read_text(encoding="utf-8").strip()
+    assert name, "champion.txt must not be empty"
+    assert (PROMPTS_DIR / name).exists()

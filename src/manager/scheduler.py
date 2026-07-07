@@ -64,17 +64,40 @@ class ManagerScheduler:
         self.events_dir = events_dir
         self.estimated_cost_per_cycle_zar = estimated_cost_per_cycle_zar
 
+        self.enabled = bool(config.get("manager.enabled", True))
         self.cycle_minutes = config.get("manager.cycle_minutes", 60)
         self.min_gap_minutes = config.get("manager.min_gap_minutes", 20)
         self.max_cycles_per_day = config.get("manager.max_cycles_per_day", 20)
-        self.session_boundary_hour = config.get("risk.session_boundary_hour_utc", 21)
+        # Same fallback chain as src/main.py and src/risk/*: the newer
+        # trading.session_reset_hour_utc key is authoritative; the older
+        # risk.session_boundary_hour_utc kept only as a fallback.
+        self.session_boundary_hour = config.get(
+            "trading.session_reset_hour_utc",
+            config.get("risk.session_boundary_hour_utc", 21),
+        )
         self.api_budget_zar_total = config.get("manager.api_budget_zar_total", 500)
         self.api_budget_days = config.get("manager.api_budget_days", 10)
         self.api_budget_zar_per_day = config.get("manager.api_budget_zar_per_day", 50)
 
-        self._last_cycle_at: Optional[datetime] = None
+        # Seed min-gap from the journal so a process restart can't fire a
+        # cycle immediately after a recent one recorded by the previous run.
+        self._last_cycle_at: Optional[datetime] = self._last_cycle_from_journal()
         self._next_timer_at: Optional[datetime] = None
         self._budget_warned_date = None
+        # Events seen but not yet acted on (deferred by min-gap). Kept in
+        # memory so a suppressed event fires once the gap expires instead
+        # of being silently deleted with its file.
+        self._pending_events: list = []
+
+    def _last_cycle_from_journal(self) -> Optional[datetime]:
+        try:
+            df = self.journal.get_manager_log(limit=1)
+            if df.empty:
+                return None
+            return datetime.fromisoformat(str(df.iloc[0]["ts_utc"]))
+        except Exception as e:  # pragma: no cover — defensive
+            logger.warning(f"manager scheduler: could not seed min-gap from manager_log: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Event consumption
@@ -206,15 +229,27 @@ class ManagerScheduler:
         Returns (fire, trigger, reason):
           - fire=True, trigger='<event type>' or 'timer', reason describing why.
           - fire=False, trigger=None, reason one of
-            'min_gap' | 'waiting' | 'daily_cap_exceeded'.
+            'disabled' | 'min_gap' | 'waiting' | 'daily_cap_exceeded'.
+
+        Event handling policy:
+          - disabled: event files are left on disk untouched.
+          - min-gap: events are consumed from disk but DEFERRED in memory —
+            they fire as soon as the gap expires (no signal loss).
+          - daily cap: deferred/pending events are DROPPED intentionally,
+            with an explicit log line (the cap is a hard daily stop; a
+            stale event firing after the 21:00 UTC boundary would be
+            acting on yesterday's signal).
 
         Does NOT consult the budget governor — callers must call
         `check_budget()` separately once `fire` is True, since a
         budget-exhausted skip still needs to be logged/warned (unlike a
         plain "not time yet" no-op).
         """
+        if not self.enabled:
+            return False, None, "disabled"
+
         now = self.now_fn()
-        events = self.poll_events()
+        self._pending_events.extend(self.poll_events())
 
         if self._last_cycle_at is not None:
             gap_minutes = (now - self._last_cycle_at).total_seconds() / 60.0
@@ -223,9 +258,17 @@ class ManagerScheduler:
 
         ok, cap_reason = self.check_daily_cap(now)
         if not ok:
+            if self._pending_events:
+                logger.info(
+                    "manager scheduler: dropping %d pending event(s) at daily cap: %s",
+                    len(self._pending_events),
+                    [e.get("type", "event") for e in self._pending_events],
+                )
+                self._pending_events = []
             return False, None, cap_reason
 
-        if events:
+        if self._pending_events:
+            events, self._pending_events = self._pending_events, []
             return True, events[0].get("type", "event"), "event"
 
         if self._next_timer_at is None:

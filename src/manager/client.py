@@ -88,7 +88,15 @@ _VERSION_RE = re.compile(r"^v(\d+)\.md$")
 
 class ManagerAPIUnavailable(Exception):
     """Raised when the Anthropic API is unavailable after SDK retries, or
-    returns a response the client cannot use (e.g. no tool_use block)."""
+    returns a response the client cannot use (e.g. no tool_use block).
+
+    When a response WAS received (and therefore billed) but was unusable,
+    `usage` carries `{input_tokens, output_tokens, cost_zar}` so the caller
+    can still record the cost against the API budget. `usage` is None when
+    the request never produced a billed response.
+    """
+
+    usage: Optional[dict] = None
 
 
 def cost_zar(input_tokens: int, output_tokens: int, usd_zar_rate: float) -> float:
@@ -140,6 +148,10 @@ class ManagerClient:
     Wraps one Anthropic Messages API call per manager cycle: forced
     `propose_adjustments` tool call, prompt-cached system prompt, briefing
     JSON as the (uncached) user message.
+
+    The champion system prompt is loaded ONCE, here at construction —
+    a running manager process must be restarted to pick up a newly
+    promoted champion (see src/manager/prompts/README.md).
     """
 
     def __init__(
@@ -192,17 +204,6 @@ class ManagerClient:
         except anthropic.APIStatusError as e:
             raise ManagerAPIUnavailable(f"API error: {e}") from e
 
-        tool_block = next(
-            (block for block in response.content if getattr(block, "type", None) == "tool_use"),
-            None,
-        )
-        if tool_block is None:
-            raise ManagerAPIUnavailable("Anthropic response contained no tool_use block")
-
-        data = tool_block.input  # already a parsed dict — never json.loads a string
-        proposals = data.get("adjustments", [])
-        rationale = data.get("rationale", "")
-
         input_tokens = response.usage.input_tokens
         output_tokens = response.usage.output_tokens
         usage = {
@@ -210,4 +211,19 @@ class ManagerClient:
             "output_tokens": output_tokens,
             "cost_zar": cost_zar(input_tokens, output_tokens, self.usd_zar_rate),
         }
+
+        tool_block = next(
+            (block for block in response.content if getattr(block, "type", None) == "tool_use"),
+            None,
+        )
+        if tool_block is None:
+            # This response was billed — attach its usage so the runner can
+            # still record the cost against the API budget.
+            exc = ManagerAPIUnavailable("Anthropic response contained no tool_use block")
+            exc.usage = usage
+            raise exc
+
+        data = tool_block.input  # already a parsed dict — never json.loads a string
+        proposals = data.get("adjustments", [])
+        rationale = data.get("rationale", "")
         return proposals, rationale, usage
