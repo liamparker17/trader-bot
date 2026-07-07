@@ -156,3 +156,20 @@ telegram:
   alert_on_api_error: true
   alert_on_milestone: true
   daily_summary_hour_utc: 21         # Send daily summary at 9 PM UTC
+
+# --- Claude Manager (Task 13) ---
+manager:
+  enabled: true
+  model: "claude-opus-4-8"
+  cycle_minutes: 60
+  min_gap_minutes: 20
+  max_cycles_per_day: 20
+  max_adjustments_per_cycle: 3
+  event_triggers:
+    drawdown_pct: 2.0
+    consecutive_losses: 3
+    circuit_breaker: true
+  usd_zar_rate: 18.0
+  api_budget_zar_total: 500
+  api_budget_days: 10
+  api_budget_zar_per_day: 50

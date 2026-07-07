@@ -317,6 +317,7 @@ def test_manager_command_reads_existing_manager_log(journal, paths, capsys):
     assert rc == 0
     assert out["count"] == 1
     assert out["entries"][0]["rationale"] == "checked in"
+    assert out["entries"][0]["outcome"] == "no_op"
 
 
 def test_manager_verdict_stub(journal, paths, capsys):

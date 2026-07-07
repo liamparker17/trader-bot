@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from src.config import Config
+from src.manager.events import drop_manager_event
 from src.risk.ratchet_floor import RatchetFloor
 
 logger = logging.getLogger("traderbot.risk.breaker")
@@ -40,6 +41,12 @@ class CircuitBreaker:
         # Thresholds from config
         self.consec_loss_reduce = config.get("risk.consecutive_loss_reduce_at", 3)
         self.consec_loss_pause = config.get("risk.consecutive_loss_pause_at", 5)
+        self.manager_event_consecutive_losses = config.get(
+            "manager.event_triggers.consecutive_losses", 3
+        )
+        self.manager_event_on_circuit_breaker = config.get(
+            "manager.event_triggers.circuit_breaker", True
+        )
         self.pause_duration_min = config.get("risk.pause_duration_minutes", 30)
         self.min_win_rate = config.get("risk.min_win_rate_threshold", 0.45)
         self.win_rate_lookback = config.get("risk.min_win_rate_lookback", 100)
@@ -83,6 +90,11 @@ class CircuitBreaker:
         else:
             self.consecutive_losses += 1
             logger.info(f"Consecutive losses: {self.consecutive_losses}")
+            if self.consecutive_losses == self.manager_event_consecutive_losses:
+                drop_manager_event(
+                    "consecutive_losses",
+                    {"consecutive_losses": self.consecutive_losses},
+                )
 
         # Check consecutive loss pause
         if self.consecutive_losses >= self.consec_loss_pause:
@@ -255,6 +267,8 @@ class CircuitBreaker:
         self.pause_reason = reason
         self.pause_until = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
         logger.warning(f"CIRCUIT BREAKER PAUSE: {reason} (for {duration_minutes} min)")
+        if self.manager_event_on_circuit_breaker:
+            drop_manager_event("circuit_breaker_trip", {"reason": reason, "action": "pause"})
 
     def _unpause(self):
         """Deactivate pause."""
@@ -268,6 +282,8 @@ class CircuitBreaker:
         self.is_shutdown = True
         self.shutdown_reason = reason
         logger.critical(f"CIRCUIT BREAKER SHUTDOWN: {reason}")
+        if self.manager_event_on_circuit_breaker:
+            drop_manager_event("circuit_breaker_trip", {"reason": reason, "action": "shutdown"})
 
     def get_status(self) -> dict:
         """Get current circuit breaker status for monitoring."""
