@@ -11,7 +11,7 @@ Every trade is recorded with full details for:
 import json
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -116,6 +116,31 @@ class TradeJournal:
 
             self._migrate_control_log_columns(conn)
 
+            # Task 12: Claude-manager cycle audit trail. One row per
+            # manager invocation (briefing -> proposals -> validate/clamp
+            # -> enqueue), independent of control_log (which logs the `tb`
+            # CLI's own command queue, including manager-originated tunes
+            # once they reach the queue).
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS manager_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_utc TEXT NOT NULL,
+                    trigger TEXT,
+                    briefing_json TEXT,
+                    model TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cost_zar REAL,
+                    rationale TEXT,
+                    proposals_json TEXT,
+                    applied_json TEXT,
+                    rejected_json TEXT,
+                    outcome TEXT
+                )
+            """)
+
+            self._migrate_manager_log_columns(conn)
+
         logger.info(f"Trade journal initialized: {self.db_path}")
 
     def _migrate_control_log_columns(self, conn: sqlite3.Connection):
@@ -130,6 +155,19 @@ class TradeJournal:
         existing = {row[1] for row in conn.execute("PRAGMA table_info(control_log)").fetchall()}
         if "cmd_id" not in existing:
             conn.execute("ALTER TABLE control_log ADD COLUMN cmd_id TEXT")
+
+    def _migrate_manager_log_columns(self, conn: sqlite3.Connection):
+        """
+        Idempotently add any future manager_log columns. Guarded by
+        PRAGMA table_info so it's safe on every open, including
+        already-migrated (or brand-new) DBs. No-op today (the table is
+        created with its full column set above) — kept for parity with
+        `_migrate_control_log_columns` / `_migrate_fee_columns` so a future
+        column addition follows the same established convention.
+        """
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(manager_log)").fetchall()}
+        # Placeholder: no columns to backfill yet.
+        _ = existing
 
     def _migrate_fee_columns(self, conn: sqlite3.Connection):
         """
@@ -407,3 +445,96 @@ class TradeJournal:
                 "SELECT COUNT(*) FROM trades WHERE exit_price IS NOT NULL"
             ).fetchone()
             return result[0] if result else 0
+
+    # ------------------------------------------------------------------
+    # Task 12: manager_log (Claude-manager cycle audit trail)
+    # ------------------------------------------------------------------
+
+    def log_manager_cycle(
+        self,
+        trigger: str,
+        briefing: dict = None,
+        model: str = "",
+        input_tokens: int = None,
+        output_tokens: int = None,
+        cost_zar: float = None,
+        rationale: str = "",
+        proposals: list = None,
+        applied: list = None,
+        rejected: list = None,
+        outcome: str = "",
+        ts_utc: str = None,
+    ) -> int:
+        """
+        Record one manager cycle (briefing -> proposals -> validate/clamp)
+        as a single row. Returns the new row id.
+
+        `briefing`, `proposals`, `applied`, `rejected` are JSON-serialized
+        as-is; callers pass plain dicts/lists (already-built briefing dict,
+        already-clamped applied/rejected lists from
+        `src.manager.policy.validate_and_clamp`).
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("""
+                INSERT INTO manager_log (
+                    ts_utc, trigger, briefing_json, model, input_tokens,
+                    output_tokens, cost_zar, rationale, proposals_json,
+                    applied_json, rejected_json, outcome
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                ts_utc or datetime.now(timezone.utc).isoformat(),
+                trigger,
+                json.dumps(briefing) if briefing is not None else None,
+                model,
+                input_tokens,
+                output_tokens,
+                cost_zar,
+                rationale,
+                json.dumps(proposals) if proposals is not None else None,
+                json.dumps(applied) if applied is not None else None,
+                json.dumps(rejected) if rejected is not None else None,
+                outcome,
+            ))
+            return cur.lastrowid
+
+    def get_manager_log(
+        self,
+        days: int = None,
+        limit: int = None,
+    ) -> pd.DataFrame:
+        """
+        Query the manager_log audit trail, most recent first.
+
+        `days`: only rows with ts_utc within the last N days.
+        `limit`: cap the number of rows returned (None = no cap).
+        """
+        query = "SELECT * FROM manager_log WHERE 1=1"
+        params: list = []
+
+        if days is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            query += " AND ts_utc >= ?"
+            params.append(cutoff)
+
+        query += " ORDER BY id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        with sqlite3.connect(self.db_path) as conn:
+            return pd.read_sql_query(query, conn, params=params)
+
+    def manager_cost_since(self, ts) -> float:
+        """
+        Sum `cost_zar` for all manager_log rows with ts_utc >= ts.
+
+        `ts` may be a datetime (converted to isoformat) or an ISO-8601
+        string. Rows with a NULL cost_zar are treated as 0.
+        """
+        ts_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
+        with sqlite3.connect(self.db_path) as conn:
+            result = conn.execute(
+                "SELECT COALESCE(SUM(cost_zar), 0) FROM manager_log WHERE ts_utc >= ?",
+                (ts_str,),
+            ).fetchone()
+            return float(result[0]) if result else 0.0
