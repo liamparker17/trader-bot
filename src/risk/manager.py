@@ -318,6 +318,12 @@ class RiskManager:
                 f"Daily trade limit ({self.max_trades_per_day}) reached",
             )
 
+        # Check 7.5: Per-instrument weight mute (Task 10). weight.<INSTRUMENT>
+        # == 0.0 means the instrument has been fully muted via `tb tune` —
+        # reject the entry before sizing is even attempted.
+        if self.sizer.get_weight(request.instrument) == 0.0:
+            return TradeApproval(False, f"muted by weight: {request.instrument}")
+
         # Check 8: Position sizing
         sizing = self.sizer.calculate(
             balance=current_balance,
