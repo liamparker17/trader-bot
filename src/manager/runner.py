@@ -30,7 +30,7 @@ from typing import Callable, Optional
 
 from src.config import PROJECT_ROOT, load_config
 from src.control.effective_config import EffectiveConfig
-from src.control.queue import CMD_ID_RE, INBOX_DIR, OUTBOX_DIR
+from src.control.queue import CMD_ID_RE, INBOX_DIR, MIN_REASON_LEN, OUTBOX_DIR
 from src.manager import briefing as briefing_module
 from src.manager import policy
 from src.manager.client import ManagerAPIUnavailable, ManagerClient
@@ -104,6 +104,13 @@ def _enqueue_tune(
     Fire-and-forget: the manager doesn't block waiting for the bot to
     process it (the bot may not even be running right now).
     """
+    # The queue rejects reasons shorter than MIN_REASON_LEN — a terse
+    # model-supplied reason must not get a validated tune rejected after
+    # manager_log already recorded it as applied (audit divergence).
+    reason = (reason or "").strip()
+    if len(reason) < MIN_REASON_LEN:
+        reason = f"manager tune {key}={value}" + (f": {reason}" if reason else "")
+
     inbox_dir.mkdir(parents=True, exist_ok=True)
     cmd_id = uuid.uuid4().hex
     if not CMD_ID_RE.match(cmd_id):  # pragma: no cover — defensive; uuid4 hex always matches

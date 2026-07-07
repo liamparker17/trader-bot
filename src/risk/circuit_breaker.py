@@ -74,7 +74,9 @@ class CircuitBreaker:
         # API error tracking
         self.api_errors: list[float] = []  # timestamps
         self.api_error_window = 600  # 10 minutes
-        self.api_error_limit = 5
+        # Sourced from config/safety_floor.yaml (circuit_breaker section),
+        # overlaid into settings by load_config(); the safety file wins.
+        self.api_error_limit = config.get("circuit_breaker.api_error_threshold", 5)
 
         # Spread tracking per instrument
         self.blocked_instruments: dict[str, str] = {}  # instrument → reason

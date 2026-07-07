@@ -290,3 +290,38 @@ def test_close_trade_uses_computed_deviation(monkeypatch):
 
     sent_request = mock_mt5.order_send.call_args[0][0]
     assert sent_request["deviation"] == 45
+
+
+# ----------------------------------------------------------------------
+# Final-review blocker: _units_to_lots must round DOWN and reject
+# below-minimum sizes instead of inflating them to the broker minimum
+# (which breached the 5x leverage cap on Standard accounts at R1000).
+# ----------------------------------------------------------------------
+
+def test_units_to_lots_rounds_down_to_lot_step(monkeypatch):
+    _install_mock_mt5(monkeypatch)
+    client = _make_client()
+    # 1,500 units = 0.015 lots -> floor to 0.01, never half-round to 0.02.
+    assert client._units_to_lots("EURUSD", 1500) == pytest.approx(0.01)
+
+
+def test_units_to_lots_rejects_below_broker_minimum(monkeypatch):
+    _install_mock_mt5(monkeypatch)
+    client = _make_client()
+    # 250 units = 0.0025 lots < volume_min 0.01: reject, do NOT clamp up
+    # to 1,000 units (~18x leverage at R1000).
+    with pytest.raises(MT5Error, match="below broker minimum"):
+        client._units_to_lots("EURUSD", 250)
+
+
+def test_units_to_lots_exact_minimum_passes(monkeypatch):
+    _install_mock_mt5(monkeypatch)
+    client = _make_client()
+    assert client._units_to_lots("EURUSD", 1000) == pytest.approx(0.01)
+
+
+def test_units_to_lots_caps_at_volume_max(monkeypatch):
+    mock = _install_mock_mt5(monkeypatch)
+    mock.symbol_info.return_value.volume_max = 2.0
+    client = _make_client()
+    assert client._units_to_lots("EURUSD", 500000) == pytest.approx(2.0)

@@ -950,16 +950,28 @@ class MT5Client:
         if contract_size <= 0:
             contract_size = 100000
 
-        lots = units / contract_size
+        lots_raw = units / contract_size
 
-        # Round to broker's lot step
+        # Round DOWN to the broker's lot step — position size always
+        # rounds down; half-rounding up would overshoot the risk budget.
         lot_step = info.volume_step if info else 0.01
-        lots = max(lot_step, round(lots / lot_step) * lot_step)
+        lots = math.floor(lots_raw / lot_step + 1e-9) * lot_step
 
-        # Clamp to min/max
+        # NEVER clamp up to the broker minimum: at small balances that
+        # silently multiplies risk and breaches the 5x leverage cap (e.g.
+        # 250 units clamped to a 0.01 standard lot = 1,000 units ≈ 18x at
+        # R1000). Reject instead — the executor treats this as a failed
+        # order and skips the trade.
         min_lot = info.volume_min if info else 0.01
+        if lots < min_lot:
+            raise MT5Error(
+                f"{symbol}: computed size {units} units ({lots_raw:.4f} lots) "
+                f"is below broker minimum {min_lot} lots — rejecting order "
+                f"rather than inflating risk beyond the leverage cap"
+            )
+
         max_lot = info.volume_max if info else 100.0
-        lots = max(min_lot, min(lots, max_lot))
+        lots = min(lots, max_lot)
 
         return round(lots, 2)
 

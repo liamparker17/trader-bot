@@ -7,6 +7,17 @@ cutover is a credential/flag change, gated on the hardening checklist below pass
 **Do not skip the gate.** The system is going live with real money on day one, with no month-long demo
 soak — the hardening gate is the only safety net standing in for that soak period.
 
+## Account type (blocking)
+
+**The live account MUST be Exness Standard Cent, not Standard.** At R1000 with
+1.5% risk and the 5× leverage cap, computed position sizes are ~250–300 units.
+A Standard account's minimum volume (0.01 lot = 1,000 units) is above that, and
+`MT5Client._units_to_lots` **rejects** below-minimum orders rather than
+inflating them (inflating would mean ~18× effective leverage — the final-review
+blocker). On Standard, virtually every order would be rejected; on Standard
+Cent (0.01 cent-lot ≈ 10 units) sizing works as designed. Verify after login:
+`symbol_info("EURUSDc").volume_min * trade_contract_size ≤ ~300`.
+
 ## Pre-live hardening gate (blocking — all 5 must pass)
 
 1. **All 2026-05-02 blockers A–I fixed**: single-instance lock (`src/utils/instance_lock.py`); MT5

@@ -562,7 +562,8 @@ class ControlQueue:
             if self.risk_manager is not None:
                 floor = getattr(self.risk_manager, "ratchet_floor", None)
                 if floor is not None and hasattr(floor, "current_floor"):
-                    snapshot["floor"] = floor.current_floor()
+                    # current_floor is a @property — do not call it.
+                    snapshot["floor"] = float(floor.current_floor)
         except Exception as e:
             logger.debug(f"status_snapshot: floor unavailable: {e}")
 

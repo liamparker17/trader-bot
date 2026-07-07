@@ -409,3 +409,23 @@ def test_budget_check_failure_fails_closed(tmp_path):
 
     assert client.calls == []
     assert journal.get_manager_log().empty
+
+
+def test_short_model_reason_padded_to_queue_minimum(tmp_path):
+    """Final-review fix: a terse model reason (<10 chars) must not get the
+    tune rejected by the control queue after manager_log said 'applied'."""
+    from src.control.queue import MIN_REASON_LEN
+
+    client = FakeClient(
+        proposals=[{"key": "risk.risk_per_trade_pct", "value": 1.2, "reason": "dd"}],
+        rationale="short reason test",
+    )
+    runner, journal, telegram, inbox_dir, outbox_dir, scheduler = _runner(tmp_path, client)
+
+    runner.run_once()
+
+    cmd_files = list(inbox_dir.glob("*.cmd.json"))
+    assert len(cmd_files) == 1
+    payload = json.loads(cmd_files[0].read_text(encoding="utf-8"))
+    assert len(payload["reason"].strip()) >= MIN_REASON_LEN
+    assert "dd" in payload["reason"]  # original reason preserved inside

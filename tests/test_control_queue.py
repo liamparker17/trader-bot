@@ -448,6 +448,26 @@ def test_status_snapshot_round_trip_no_control_log_row(tmp_path, monkeypatch):
     assert telegram.sent == []
 
 
+def test_status_snapshot_reports_real_ratchet_floor(tmp_path, monkeypatch):
+    # Final-review fix: current_floor is a @property; calling it raised a
+    # (swallowed) TypeError and left floor null forever, breaking the
+    # live-cutover runbook's floor verification step.
+    from src.risk.ratchet_floor import RatchetFloor
+
+    queue, journal, telegram, risk_manager, _ = _make_queue(tmp_path, monkeypatch)
+    risk_manager.ratchet_floor = RatchetFloor(
+        min_floor_zar=600, max_total_drawdown_pct=0.35,
+        state_path=tmp_path / "account_state.json",
+    )
+
+    _write_cmd(queue, "cmd1", "status_snapshot", reason="")
+    queue.poll_once()
+
+    result = _read_outbox(queue, "cmd1")
+    assert isinstance(result["detail"]["floor"], float)
+    assert result["detail"]["floor"] >= 600.0
+
+
 def test_status_snapshot_drawdown_vs_cap_populated(tmp_path, monkeypatch):
     queue, journal, telegram, risk_manager, _ = _make_queue(tmp_path, monkeypatch)
     risk_manager.drawdown = FakeDrawdownTracker(daily_dd_pct=0.02, daily_limit=0.04)
