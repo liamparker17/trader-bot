@@ -5,7 +5,10 @@ Provides real-time and historical performance analysis for the dashboard
 and decision-making.
 """
 
+import json
 import logging
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -14,6 +17,9 @@ import pandas as pd
 from src.monitoring.trade_journal import TradeJournal
 
 logger = logging.getLogger("traderbot.performance")
+
+# Sentinel "since forever" timestamp for cumulative manager-cost queries.
+_EPOCH_ISO = "1970-01-01T00:00:00+00:00"
 
 
 class PerformanceTracker:
@@ -65,7 +71,144 @@ class PerformanceTracker:
             "avg_hold_minutes": self._avg_hold_time(completed),
             "best_instrument": self._best_instrument(completed),
             "exit_reasons": self._exit_reason_breakdown(completed),
+            "api_cost_zar": self._manager_cost(),
+            "net_pnl_after_api": self.net_pnl_after_api(),
         }
+
+    # ------------------------------------------------------------------
+    # Self-funding scorecard (Task 14)
+    # ------------------------------------------------------------------
+
+    def _realized_net_pnl(self, days: Optional[int] = None) -> float:
+        """Sum of net_pnl_zar (fallback: pnl_zar) over completed trades,
+        optionally restricted to exits within the trailing `days` window."""
+        df = self.journal.get_all_trades_df()
+        completed = df[df["exit_price"].notna()].copy()
+        if completed.empty:
+            return 0.0
+        if days is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            completed = completed[completed["exit_time"] >= cutoff]
+        if completed.empty:
+            return 0.0
+        net = completed["net_pnl_zar"].fillna(completed["pnl_zar"]).fillna(0)
+        return float(net.sum())
+
+    def _manager_cost(self, days: Optional[int] = None) -> float:
+        """Sum of manager_log.cost_zar, cumulative or over trailing `days`."""
+        if days is not None:
+            since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        else:
+            since = _EPOCH_ISO
+        try:
+            return float(self.journal.manager_cost_since(since))
+        except Exception as e:  # manager_log may predate Task 12 schemas
+            logger.warning(f"manager cost query failed: {e}")
+            return 0.0
+
+    def net_pnl_after_api(self, days: Optional[int] = None) -> float:
+        """
+        Self-funding headline number: realized net P&L minus the Claude
+        manager's API cost, cumulative or over the trailing `days` window.
+        """
+        return self._realized_net_pnl(days) - self._manager_cost(days)
+
+    def manager_stats_since(self, since: datetime) -> dict:
+        """
+        Manager activity since `since` (normally today's 21:00 UTC session
+        boundary) for the daily Telegram summary: cycles run, adjustments
+        applied, API cost.
+        """
+        stats = {"cycles": 0, "adjustments_applied": 0, "api_cost_zar": 0.0}
+        try:
+            df = self.journal.get_manager_log()
+        except Exception as e:
+            logger.warning(f"manager_stats_since query failed: {e}")
+            return stats
+        if df.empty:
+            return stats
+        window = df[df["ts_utc"] >= since.isoformat()]
+        stats["cycles"] = int(len(window))
+        stats["api_cost_zar"] = float(window["cost_zar"].fillna(0).sum())
+        applied_total = 0
+        for raw in window["applied_json"].fillna(""):
+            try:
+                entries = json.loads(raw) if raw else []
+                applied_total += len(entries) if isinstance(entries, list) else 0
+            except (json.JSONDecodeError, TypeError):
+                pass
+        stats["adjustments_applied"] = applied_total
+        return stats
+
+    def days_since_first_manager_cycle(self, now: Optional[datetime] = None) -> Optional[int]:
+        """Whole days since the first manager_log row; None if no cycles yet."""
+        try:
+            with sqlite3.connect(self.journal.db_path) as conn:
+                row = conn.execute("SELECT MIN(ts_utc) FROM manager_log").fetchone()
+        except sqlite3.Error as e:
+            logger.warning(f"first-manager-cycle query failed: {e}")
+            return None
+        if not row or not row[0]:
+            return None
+        first = datetime.fromisoformat(str(row[0]))
+        now = now or datetime.now(timezone.utc)
+        return max(0, (now - first).days)
+
+    def justification_report(
+        self,
+        heuristic_baseline_pnl_zar: Optional[float] = None,
+    ) -> dict:
+        """
+        Day-10 self-funding verdict (API budget amendment):
+
+          SELF-FUNDING  — net-after-cost > 0 AND the P&L uplift over the
+                          heuristic baseline exceeds the API cost.
+          NOT JUSTIFIED — either condition fails, or no heuristic baseline
+                          is available to prove uplift (conservative).
+          PENDING       — no manager cycles logged yet.
+
+        `heuristic_baseline_pnl_zar` is the same-window P&L of the
+        no-API heuristic manager (from the Task 15/16 managed backtest).
+        """
+        days_running = self.days_since_first_manager_cycle()
+        net_pnl = self._realized_net_pnl()
+        api_cost = self._manager_cost()
+        report = {
+            "net_pnl_zar": net_pnl,
+            "api_cost_zar": api_cost,
+            "net_after_cost_zar": net_pnl - api_cost,
+            "heuristic_baseline_pnl_zar": heuristic_baseline_pnl_zar,
+            "days_since_first_cycle": days_running,
+        }
+        if days_running is None:
+            report["verdict"] = "PENDING"
+            report["reason"] = "no manager cycles logged yet"
+            return report
+        if report["net_after_cost_zar"] <= 0:
+            report["verdict"] = "NOT JUSTIFIED"
+            report["reason"] = "net-after-cost P&L is not positive"
+            return report
+        if heuristic_baseline_pnl_zar is None:
+            report["verdict"] = "NOT JUSTIFIED"
+            report["reason"] = (
+                "no heuristic baseline available to prove uplift — "
+                "run the managed backtest comparison (tb manager --verdict --baseline-pnl X)"
+            )
+            return report
+        uplift = net_pnl - heuristic_baseline_pnl_zar
+        report["uplift_zar"] = uplift
+        if uplift > api_cost:
+            report["verdict"] = "SELF-FUNDING"
+            report["reason"] = (
+                f"net-after-cost R{report['net_after_cost_zar']:.2f} > 0 and "
+                f"uplift R{uplift:.2f} exceeds API cost R{api_cost:.2f}"
+            )
+        else:
+            report["verdict"] = "NOT JUSTIFIED"
+            report["reason"] = (
+                f"uplift R{uplift:.2f} does not exceed API cost R{api_cost:.2f}"
+            )
+        return report
 
     def get_equity_curve(self, starting_balance: float = 500) -> pd.DataFrame:
         """Build equity curve DataFrame."""
@@ -188,4 +331,5 @@ class PerformanceTracker:
             "gross_profit": 0, "gross_loss": 0, "sharpe_ratio": 0,
             "max_drawdown_pct": 0, "avg_hold_minutes": 0,
             "best_instrument": "N/A", "exit_reasons": {},
+            "api_cost_zar": 0.0, "net_pnl_after_api": 0.0,
         }

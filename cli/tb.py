@@ -344,11 +344,23 @@ def cmd_model(journal: TradeJournal) -> dict:
     return result
 
 
-def cmd_manager(journal: TradeJournal, days: Optional[int], verdict: bool) -> dict:
+def cmd_manager(
+    journal: TradeJournal,
+    days: Optional[int],
+    verdict: bool,
+    baseline_pnl: Optional[float] = None,
+) -> dict:
     if verdict:
-        # Task 14 wires up the real Claude-manager verdict; this is a
-        # deliberate stub until then (per task-9 brief).
-        return {"verdict": "PENDING", "reason": "manager not yet active"}
+        # Task 14 self-funding scorecard. `baseline_pnl` is the same-window
+        # P&L of the no-API heuristic manager (from the managed backtest,
+        # Task 15/16) — without it the verdict is conservative.
+        from src.monitoring.performance import PerformanceTracker
+
+        if not _table_exists(journal.db_path, "manager_log"):
+            return {"verdict": "PENDING", "reason": "manager not yet active"}
+        return PerformanceTracker(journal).justification_report(
+            heuristic_baseline_pnl_zar=baseline_pnl,
+        )
 
     if not _table_exists(journal.db_path, "manager_log"):
         # Task 12 creates manager_log — until then, an empty result is
@@ -399,6 +411,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_manager = sub.add_parser("manager", help="Claude-manager audit log")
     p_manager.add_argument("--days", type=int, default=None)
     p_manager.add_argument("--verdict", action="store_true")
+    p_manager.add_argument("--baseline-pnl", type=float, default=None,
+                           help="Heuristic-manager same-window P&L (ZAR) for the uplift check")
 
     # `--reason` is intentionally NOT argparse `required=True`: a missing
     # --reason should surface as our own {"error": ...} JSON on stdout via
@@ -461,7 +475,7 @@ def main(
         elif args.command == "model":
             payload = cmd_model(jrn)
         elif args.command == "manager":
-            payload = cmd_manager(jrn, args.days, args.verdict)
+            payload = cmd_manager(jrn, args.days, args.verdict, args.baseline_pnl)
         elif args.command == "pause":
             reason = _validate_reason(args.reason)
             payload = _enqueue_and_report("pause", {}, reason, inbox_dir, outbox_dir, timeout, poll_interval)

@@ -174,8 +174,15 @@ def test_call_raises_manager_api_unavailable_when_no_tool_use_block(tmp_path):
     response = FakeResponse(content=[FakeTextBlock("no tool call")], input_tokens=10, output_tokens=5)
     fake_client = FakeAnthropicClient(response=response)
     manager_client = ManagerClient(_config(), client=fake_client, prompts_dir=tmp_path)
-    with pytest.raises(ManagerAPIUnavailable):
+    with pytest.raises(ManagerAPIUnavailable) as excinfo:
         manager_client.call({"balance": 1000})
+    # The response WAS billed — its usage must ride on the exception so the
+    # runner can record the cost against the API budget (fix-round pin).
+    usage = excinfo.value.usage
+    assert usage is not None
+    assert usage["input_tokens"] == 10
+    assert usage["output_tokens"] == 5
+    assert usage["cost_zar"] > 0
 
 
 # ---------------------------------------------------------------------------

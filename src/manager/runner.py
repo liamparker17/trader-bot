@@ -177,8 +177,13 @@ class ManagerRunner:
         try:
             ok, budget_reason = self.scheduler.check_budget(now)
         except Exception:
-            logger.error("manager runner: scheduler.check_budget() failed", exc_info=True)
-            ok, budget_reason = True, None
+            # Fail CLOSED: a skipped cycle is cheap; spending with the
+            # budget governor blind is not.
+            logger.error(
+                "manager runner: scheduler.check_budget() failed — skipping "
+                "cycle (fail-closed)", exc_info=True,
+            )
+            return
 
         try:
             if not ok:

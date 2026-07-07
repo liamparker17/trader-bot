@@ -435,6 +435,7 @@ def test_events_at_daily_cap_are_dropped_with_log(tmp_path, caplog):
     assert reason == "daily_cap_exceeded"
     # Intentional, logged drop — not a silent loss.
     assert any("dropp" in rec.message.lower() for rec in caplog.records)
-    # And the buffer is actually cleared (no ghost fire after cap resets... same day).
+    # And the buffer is actually cleared - not merely suppressed by the cap.
+    assert scheduler._pending_events == []
     fire2, _, reason2 = scheduler.should_fire()
     assert fire2 is False

@@ -944,6 +944,39 @@ class TraderBot:
                 return
 
             summary = self.performance.get_summary()
+
+            # Task 14 self-funding scorecard: manager activity since the
+            # session boundary + net-after-API-cost figures. Best-effort —
+            # never let scorecard math break the summary itself.
+            manager_kwargs = {}
+            try:
+                now = datetime.now(timezone.utc)
+                boundary_hour = self.config.get(
+                    "trading.session_reset_hour_utc",
+                    self.config.get("risk.session_boundary_hour_utc", 21),
+                )
+                day_start = now.replace(
+                    hour=boundary_hour, minute=0, second=0, microsecond=0)
+                if day_start > now:
+                    day_start -= timedelta(days=1)
+                stats = self.performance.manager_stats_since(day_start)
+                if stats["cycles"] > 0 or self.performance.days_since_first_manager_cycle(now) is not None:
+                    manager_kwargs = {
+                        "manager_cycles": stats["cycles"],
+                        "manager_adjustments": stats["adjustments_applied"],
+                        "api_cost_today": stats["api_cost_zar"],
+                        "net_after_cost_today": self.performance.net_pnl_after_api(days=1),
+                        "net_after_cost_total": self.performance.net_pnl_after_api(),
+                    }
+                    days_running = self.performance.days_since_first_manager_cycle(now)
+                    if days_running is not None and days_running >= 8:
+                        report = self.performance.justification_report()
+                        manager_kwargs["verdict_line"] = (
+                            f"{report['verdict']} — {report['reason']}"
+                        )
+            except Exception as e:
+                logger.warning(f"Daily summary manager scorecard failed: {e}")
+
             self.telegram.daily_summary(
                 date=boundary_date,
                 trades=summary.get("total_trades", 0),
@@ -953,6 +986,7 @@ class TraderBot:
                 balance=balance,
                 win_rate=summary.get("win_rate", 0.0),
                 max_drawdown=summary.get("max_drawdown_pct", 0.0),
+                **manager_kwargs,
             )
             self.daily_summary_scheduler.mark_fired(boundary_date)
         except Exception as e:

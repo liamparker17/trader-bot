@@ -392,3 +392,20 @@ def test_disabled_manager_runs_no_cycles(tmp_path):
 
     assert client.calls == []
     assert journal.get_manager_log().empty
+
+
+def test_budget_check_failure_fails_closed(tmp_path):
+    """If the budget governor itself errors, skip the cycle — never spend
+    with the governor blind."""
+    client = FakeClient(proposals=[{"key": "risk.risk_per_trade_pct", "value": 1.2, "reason": "r"}])
+    runner, journal, telegram, inbox_dir, outbox_dir, scheduler = _runner(tmp_path, client)
+
+    def exploding_check_budget(now):
+        raise RuntimeError("journal unreadable")
+
+    scheduler.check_budget = exploding_check_budget
+
+    runner.run_once()  # must not raise
+
+    assert client.calls == []
+    assert journal.get_manager_log().empty

@@ -327,8 +327,21 @@ class TelegramBot:
         balance: float,
         win_rate: float,
         max_drawdown: float,
+        manager_cycles: Optional[int] = None,
+        manager_adjustments: Optional[int] = None,
+        api_cost_today: Optional[float] = None,
+        net_after_cost_today: Optional[float] = None,
+        net_after_cost_total: Optional[float] = None,
+        verdict_line: Optional[str] = None,
     ):
-        """Send daily summary report."""
+        """
+        Send daily summary report. The manager_* / verdict parameters are
+        optional (Task 14 self-funding scorecard): when provided, a Manager
+        section is appended — cycles run today, adjustments applied, API
+        cost today, net-after-cost P&L today + cumulative, and (from day 8
+        of the API budget window onward) the SELF-FUNDING / NOT JUSTIFIED
+        verdict line.
+        """
         emoji = "\u2705" if pnl >= 0 else "\U0001f534"
 
         text = (
@@ -339,4 +352,19 @@ class TelegramBot:
             f"Max Drawdown: {max_drawdown:.1%}\n"
             f"\U0001f4b0 Balance: R{balance:.2f}"
         )
+
+        if manager_cycles is not None:
+            text += (
+                f"\n\n\U0001f9e0 <b>Manager</b>\n"
+                f"Manager cycles: {manager_cycles} "
+                f"({manager_adjustments or 0} adjustments applied)\n"
+                f"API cost today: R{(api_cost_today or 0.0):.2f}"
+            )
+            if net_after_cost_today is not None:
+                text += f"\nNet after cost today: R{net_after_cost_today:+.2f}"
+            if net_after_cost_total is not None:
+                text += f"\nNet after cost total: R{net_after_cost_total:+.2f}"
+            if verdict_line:
+                text += f"\nVerdict: {verdict_line}"
+
         self._send(text)

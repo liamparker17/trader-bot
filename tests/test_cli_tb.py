@@ -320,12 +320,14 @@ def test_manager_command_reads_existing_manager_log(journal, paths, capsys):
     assert out["entries"][0]["outcome"] == "no_op"
 
 
-def test_manager_verdict_stub(journal, paths, capsys):
+def test_manager_verdict_pending_before_first_cycle(journal, paths, capsys):
+    # Task 14 wired the real justification_report: with a manager_log table
+    # but no cycles yet, the verdict is PENDING.
     rc = tb.main(["manager", "--verdict"], config=journal.config, journal=journal,
                   inbox_dir=paths["inbox"], outbox_dir=paths["outbox"])
     out = json.loads(capsys.readouterr().out)
     assert rc == 0
-    assert out == {"verdict": "PENDING", "reason": "manager not yet active"}
+    assert out["verdict"] == "PENDING"
 
 
 # ---------------------------------------------------------------------

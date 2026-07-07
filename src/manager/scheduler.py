@@ -239,6 +239,11 @@ class ManagerScheduler:
             with an explicit log line (the cap is a hard daily stop; a
             stale event firing after the 21:00 UTC boundary would be
             acting on yesterday's signal).
+          - budget exhausted: an event still "fires" here and is consumed;
+            the runner then logs it as outcome=budget_exhausted. This is
+            intentional — the event isn't silent (it becomes an audit row
+            + one-per-day Telegram warning), but no API cycle runs for it
+            while the budget is spent.
 
         Does NOT consult the budget governor — callers must call
         `check_budget()` separately once `fire` is True, since a
