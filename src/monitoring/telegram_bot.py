@@ -298,6 +298,22 @@ class TelegramBot:
             logger.warning(f"mt5_reconnected alert failed: {e}")
 
     # ------------------------------------------------------------------
+    # Claude manager
+    # ------------------------------------------------------------------
+
+    def manager_cycle(self, summary: str):
+        """
+        Alert: one Claude-manager cycle finished (or was skipped/failed).
+        `summary` is a pre-formatted one-line-ish string, e.g.
+        "[MANAGER] cycle: 2 applied, 1 clamped — rationale...". Best-effort,
+        never raises.
+        """
+        try:
+            self._send(f"\U0001f9e0 {summary}")
+        except Exception as e:
+            logger.warning(f"manager_cycle alert failed: {e}")
+
+    # ------------------------------------------------------------------
     # Reports
     # ------------------------------------------------------------------
 
