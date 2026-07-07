@@ -48,3 +48,8 @@ logs/
 CLAUDE.md
 .claude/
 SKILL.md
+control/inbox/
+control/outbox/
+control/deadletter/
+control/effective_config.json
+control/manager_events/
