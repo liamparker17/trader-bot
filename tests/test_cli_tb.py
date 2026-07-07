@@ -302,24 +302,21 @@ def test_manager_command_before_task_12_returns_empty(journal, paths, capsys):
 
 
 def test_manager_command_reads_existing_manager_log(journal, paths, capsys):
-    with sqlite3.connect(journal.db_path) as conn:
-        conn.execute("""
-            CREATE TABLE manager_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_utc TEXT NOT NULL,
-                note TEXT
-            )
-        """)
-        conn.execute(
-            "INSERT INTO manager_log (ts_utc, note) VALUES (?, ?)",
-            (datetime.now(timezone.utc).isoformat(), "checked in"),
-        )
+    # manager_log is created by TradeJournal._init_db since Task 12 —
+    # insert through the real API rather than a hand-rolled schema.
+    journal.log_manager_cycle(
+        trigger="timer",
+        model="claude-opus-4-8",
+        rationale="checked in",
+        outcome="no_op",
+        ts_utc=datetime.now(timezone.utc).isoformat(),
+    )
     rc = tb.main(["manager"], config=journal.config, journal=journal,
                   inbox_dir=paths["inbox"], outbox_dir=paths["outbox"])
     out = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert out["count"] == 1
-    assert out["entries"][0]["note"] == "checked in"
+    assert out["entries"][0]["rationale"] == "checked in"
 
 
 def test_manager_verdict_stub(journal, paths, capsys):
