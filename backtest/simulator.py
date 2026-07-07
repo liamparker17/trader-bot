@@ -125,6 +125,14 @@ class BacktestSimulator:
         # Simulation settings
         self.slippage_pips = 0.5  # Assumed slippage per trade
 
+        # Optional manager-mode parameter overlay (backtest.manager_sim).
+        # None in baseline runs — every consult below is None-guarded so a
+        # no-manager backtest behaves exactly as before this hook existed.
+        # When set, it must expose:
+        #   effective_risk_pct(inst_risk_frac) -> float  (risk % as fraction)
+        #   weight(instrument) -> float                  (0.0 mutes)
+        self.param_overlay = None
+
     def run(
         self,
         m1_df: pd.DataFrame,
@@ -319,8 +327,23 @@ class BacktestSimulator:
         sl_pips = (atr * inst_sl_mult) / pip_size
         sl_pips = max(min_sl, min(sl_pips, max_sl))
 
+        # Manager-mode overlay (backtest.manager_sim): tuned global risk %
+        # scales the per-instrument risk, and the per-instrument weight
+        # multiplies the risk amount BEFORE the consecutive-loss/volatility
+        # adjustments and the leverage clamp — mirroring the ordering in
+        # src/risk/position_sizer.py (Step 3.5). weight == 0.0 mutes the
+        # instrument (handled upstream too, but guarded here defensively).
+        overlay_weight = 1.0
+        if self.param_overlay is not None:
+            inst_risk_pct = self.param_overlay.effective_risk_pct(inst_risk_pct)
+            overlay_weight = self.param_overlay.weight(instrument)
+            if overlay_weight <= 0.0:
+                return None
+
         # Position sizing: risk_amount / (sl_pips * pip_value_per_unit)
         risk_amount = state.balance * inst_risk_pct
+        if overlay_weight != 1.0:
+            risk_amount *= overlay_weight
 
         # Reduce size after consecutive losses
         if state.consecutive_losses >= self.consec_loss_reduce:
