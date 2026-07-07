@@ -111,3 +111,46 @@ Baseline after merge: 190 tests passing.
 ## Worktree
 `C:\Users\liamp\Desktop\Portfolio\TraderBot\.claude\worktrees\agent-af47d0f89884220a9`
 Branch: `worktree-agent-af47d0f89884220a9`
+
+## Fix Round 1
+
+Addressed two review findings.
+
+**Finding 1 — duplicate proposal keys (`src/manager/policy.py`, `validate_and_clamp`):**
+Added a dedup pass applied to the `accepted` slice (post `MAX_PROPOSALS_PER_CYCLE` cap, so
+positional/cap semantics are unchanged) but before validation/clamping. For a repeated key,
+the last occurrence wins and is the one validated/clamped/applied-or-rejected normally; earlier
+occurrence(s) are rejected outright with `rejection_reason: "duplicate_key_superseded"`. This
+guarantees exactly one entry per key across `(applied ∪ rejected)` for any key present in the
+accepted slice — closing the double-enqueue / mis-keyed-rejection risk. Overflow (4th+) proposals
+are untouched by dedup and still rejected via `cycle_limit_exceeded`.
+
+**Finding 2 — non-raising briefing size cap (`src/manager/briefing.py`, `_enforce_size_cap`):**
+Replaced the trailing `assert` with an escalating soft-degrade sequence: (1) existing
+newest-first list truncation (`open_positions`, `last_manager_actions`), (2) collapse
+per-instrument stats down to a bare `{"trades": n}` count, (3) replace `config_delta` with
+`{"truncated": true, "keys": [...]}`, (4) last resort — stamp `briefing_truncated: True` on the
+briefing and log a `WARNING`, returning without raising regardless of final size. `build()`'s
+docstring updated to match (no more "hard failure mode" assertion).
+
+**Tests added** (`tests/test_manager_policy.py`, `tests/test_manager_briefing.py`):
+- `test_duplicate_key_valid_valid_last_wins` — dup valid+valid, last wins, first superseded.
+- `test_duplicate_key_valid_then_invalid_last_loses` — dup valid+invalid; last (invalid) is
+  validated and rejected as `non_numeric`, first is `duplicate_key_superseded`.
+- `test_duplicate_key_spanning_cap_boundary` — duplicate of an already-accepted key appearing
+  as the 4th (overflow) proposal is rejected via `cycle_limit_exceeded`, not dedup; no
+  double-counting of the key across applied/rejected.
+- `test_enforce_size_cap_never_raises_on_oversized_instruments` — oversized `instruments`/
+  `config_delta` (no truncatable lists) exercises stages 2–3, no raise.
+- `test_enforce_size_cap_last_resort_marker_never_raises` — pathological size even after all
+  stages; confirms `briefing_truncated` marker and no raise.
+- `test_enforce_size_cap_normal_briefing_unchanged` — a normal-sized briefing is byte-for-byte
+  unchanged by `_enforce_size_cap`.
+
+**Verification:** `pytest tests/test_manager_policy.py tests/test_manager_briefing.py
+tests/test_manager_log.py -q` → 62 passed. `pytest tests/ -x -q` → 252 passed (full suite,
+up from the prior 246 baseline + 6 new tests).
+
+**Deliberately unchanged:** stage-2 instrument collapse keeps only `trades` count (dropping
+win_rate/profit_factor/net_pnl_zar/current_weight) per the brief's "summary counts" wording;
+did not attempt a finer-grained partial-field degrade since the brief specified counts only.

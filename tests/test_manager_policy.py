@@ -336,6 +336,80 @@ def test_fourth_proposal_rejected(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Duplicate keys within one proposal set: last occurrence wins, earlier
+# occurrence(s) rejected as superseded. Exactly one entry per key across
+# (applied, rejected) from the accepted (<=3) slice.
+# ---------------------------------------------------------------------------
+
+def test_duplicate_key_valid_valid_last_wins(monkeypatch, tmp_path):
+    eff = _eff(monkeypatch, tmp_path)
+    proposals = [
+        {"key": "risk.risk_per_trade_pct", "value": 1.6},
+        {"key": "risk.risk_per_trade_pct", "value": 1.8},
+    ]
+    applied, rejected = validate_and_clamp(proposals, eff, risk_ceiling_now=2.5)
+    assert len(applied) == 1
+    assert applied[0]["value"] == 1.8
+    assert len(rejected) == 1
+    assert rejected[0]["value"] == 1.6
+    assert rejected[0]["rejection_reason"] == "duplicate_key_superseded"
+    # Exactly one entry per key across applied+rejected.
+    keys = [e["key"] for e in applied] + [e["key"] for e in rejected]
+    assert keys.count("risk.risk_per_trade_pct") == 2  # one applied, one rejected
+    assert len(set(keys)) == 1
+
+
+def test_duplicate_key_valid_then_invalid_last_loses(monkeypatch, tmp_path):
+    # First occurrence would be valid on its own; the second (last, wins
+    # positionally) is invalid (out of numeric range is fine, but here we
+    # use a bad instrument to force a validation rejection independent of
+    # clamping) -> last is validated (and rejected), first is superseded.
+    eff = _eff(monkeypatch, tmp_path)
+    _instruments(monkeypatch, tmp_path)
+    proposals = [
+        {"key": "weight.EUR_USD", "value": 1.1},
+        {"key": "weight.EUR_USD", "value": "not-a-number"},
+    ]
+    applied, rejected = validate_and_clamp(proposals, eff, risk_ceiling_now=2.5)
+    assert applied == []
+    assert len(rejected) == 2
+    reasons = {r["rejection_reason"] for r in rejected}
+    assert reasons == {"duplicate_key_superseded", "non_numeric"}
+    # The superseded entry carries the FIRST (valid) proposal's value; the
+    # non_numeric entry carries the second (last) proposal's value.
+    superseded = next(r for r in rejected if r["rejection_reason"] == "duplicate_key_superseded")
+    non_numeric = next(r for r in rejected if r["rejection_reason"] == "non_numeric")
+    assert superseded["value"] == 1.1
+    assert non_numeric["value"] == "not-a-number"
+    keys = [r["key"] for r in rejected]
+    assert len(set(keys)) == 1
+
+
+def test_duplicate_key_spanning_cap_boundary(monkeypatch, tmp_path):
+    # Dedup happens AFTER the <=3 slice: a duplicate of an accepted key
+    # appearing beyond position 3 is dropped by the cycle cap, not by
+    # dedup, and must not resurrect/duplicate the earlier key.
+    eff = _eff(monkeypatch, tmp_path)
+    _instruments(monkeypatch, tmp_path, names=("EUR_USD", "GBP_USD", "XAU_USD"))
+    proposals = [
+        {"key": "risk.risk_per_trade_pct", "value": 1.6},
+        {"key": "weight.EUR_USD", "value": 1.1},
+        {"key": "weight.GBP_USD", "value": 0.9},
+        {"key": "risk.risk_per_trade_pct", "value": 1.7},  # 4th: beyond cap
+    ]
+    applied, rejected = validate_and_clamp(proposals, eff, risk_ceiling_now=2.5)
+    assert len(applied) == 3
+    assert applied[0]["key"] == "risk.risk_per_trade_pct"
+    assert applied[0]["value"] == 1.6  # first occurrence kept (only one in accepted slice)
+    assert len(rejected) == 1
+    assert rejected[0]["key"] == "risk.risk_per_trade_pct"
+    assert rejected[0]["value"] == 1.7
+    assert rejected[0]["rejection_reason"] == "cycle_limit_exceeded"
+    keys = [e["key"] for e in applied] + [e["key"] for e in rejected]
+    assert keys.count("risk.risk_per_trade_pct") == 2  # one applied, one cycle-limit rejected
+
+
+# ---------------------------------------------------------------------------
 # threshold_low <= threshold_high pair-wise invariant
 # ---------------------------------------------------------------------------
 

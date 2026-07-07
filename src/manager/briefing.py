@@ -187,9 +187,18 @@ def _serialized_len(briefing: dict) -> int:
 
 def _enforce_size_cap(briefing: dict) -> None:
     """
-    Truncate newest-first list fields (dropping the oldest entries) until
-    the serialized briefing fits MAX_BRIEFING_CHARS, then hard-assert.
+    Escalating soft cap: shrink the briefing in stages until it fits
+    MAX_BRIEFING_CHARS. Never raises — this must degrade, not fail the
+    manager cycle.
+
+    Stages, in order:
+      1. Truncate newest-first list fields (dropping the oldest entries).
+      2. Collapse per-instrument stats down to a bare trade count.
+      3. Replace config_delta with a marker + key list.
+      4. Last resort: stamp `briefing_truncated: True` and log a WARNING,
+         leaving the (still possibly oversized) briefing as-is.
     """
+    # Stage 1: drop oldest entries from newest-first list fields.
     while _serialized_len(briefing) > MAX_BRIEFING_CHARS:
         shrank = False
         for key in TRUNCATABLE_LIST_FIELDS:
@@ -202,10 +211,38 @@ def _enforce_size_cap(briefing: dict) -> None:
         if not shrank:
             break
 
-    assert _serialized_len(briefing) <= MAX_BRIEFING_CHARS, (
-        f"briefing exceeds {MAX_BRIEFING_CHARS} chars even after truncation "
-        f"({_serialized_len(briefing)} chars)"
-    )
+    if _serialized_len(briefing) <= MAX_BRIEFING_CHARS:
+        return
+
+    # Stage 2: collapse per-instrument detail to summary trade counts.
+    instruments = briefing.get("instruments")
+    if isinstance(instruments, dict) and instruments:
+        briefing["instruments"] = {
+            name: {"trades": (stats or {}).get("trades")}
+            for name, stats in instruments.items()
+        }
+        if _serialized_len(briefing) <= MAX_BRIEFING_CHARS:
+            return
+
+    # Stage 3: replace config_delta with a truncation marker.
+    config_delta = briefing.get("config_delta")
+    if isinstance(config_delta, dict) and config_delta:
+        briefing["config_delta"] = {
+            "truncated": True,
+            "keys": list(config_delta.keys()),
+        }
+        if _serialized_len(briefing) <= MAX_BRIEFING_CHARS:
+            return
+
+    # Stage 4: last resort — mark and log, but never raise.
+    if _serialized_len(briefing) > MAX_BRIEFING_CHARS:
+        briefing["briefing_truncated"] = True
+        logger.warning(
+            "Briefing still exceeds %d chars after all truncation stages "
+            "(%d chars) — sending as-is with briefing_truncated marker.",
+            MAX_BRIEFING_CHARS,
+            _serialized_len(briefing),
+        )
 
 
 def build(
@@ -220,9 +257,11 @@ def build(
     Assemble the compact JSON briefing handed to the Claude-manager.
 
     Every field degrades independently (never raises for a missing/stale
-    source); the only hard failure mode is the final size-cap assertion,
-    which truncates trade-list fields (keeping the newest entries) before
-    asserting.
+    source). The final size cap is also non-raising: it truncates
+    trade-list fields (keeping the newest entries), then collapses
+    per-instrument detail and config_delta, and as a last resort marks
+    the briefing `briefing_truncated: True` rather than ever failing the
+    manager cycle.
     """
     milestones = _safe(
         lambda: effective_config.get("growth.milestones", DEFAULT_MILESTONES) or DEFAULT_MILESTONES,

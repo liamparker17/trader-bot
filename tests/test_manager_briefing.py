@@ -232,3 +232,51 @@ def test_open_positions_truncated_keeping_newest_when_oversized(monkeypatch, tmp
     kept_ids = {p["trade_id"] for p in briefing["open_positions"]}
     assert "open-0" in kept_ids
     assert len(briefing["open_positions"]) < 400
+
+
+def test_enforce_size_cap_never_raises_on_oversized_instruments(monkeypatch):
+    # Force an oversized "instruments" dict (no truncatable list fields to
+    # shrink) to exercise stage 2 (instrument detail collapse) and confirm
+    # the size guard degrades instead of raising.
+    briefing = {
+        "instruments": {
+            f"INSTR_{i}": {
+                "trades": i,
+                "win_rate": 0.5,
+                "profit_factor": 1.2,
+                "net_pnl_zar": 123.456,
+                "current_weight": 1.0,
+                "padding": "x" * 200,
+            }
+            for i in range(200)
+        },
+        "config_delta": {f"key_{i}": i for i in range(50)},
+        "open_positions": [],
+        "last_manager_actions": [],
+    }
+    briefing_module._enforce_size_cap(briefing)  # must not raise
+    assert len(json.dumps(briefing, default=str)) <= briefing_module.MAX_BRIEFING_CHARS or briefing.get(
+        "briefing_truncated"
+    ) is True
+
+
+def test_enforce_size_cap_last_resort_marker_never_raises():
+    # Pathologically oversized even after every truncation stage -> stage 4
+    # must stamp briefing_truncated and return without raising.
+    briefing = {
+        "instruments": {f"INSTR_{i}": {"trades": i} for i in range(5000)},
+        "config_delta": {"truncated": True, "keys": [f"k{i}" for i in range(5000)]},
+        "open_positions": [],
+        "last_manager_actions": [],
+    }
+    briefing_module._enforce_size_cap(briefing)  # must not raise
+    assert briefing.get("briefing_truncated") is True
+
+
+def test_enforce_size_cap_normal_briefing_unchanged(monkeypatch, tmp_path):
+    _, _, _, briefing = _build(monkeypatch, tmp_path)
+    before = json.dumps(briefing, sort_keys=True)
+    briefing_module._enforce_size_cap(briefing)
+    after = json.dumps(briefing, sort_keys=True)
+    assert before == after
+    assert "briefing_truncated" not in briefing

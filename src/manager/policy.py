@@ -132,6 +132,24 @@ def validate_and_clamp(
     accepted = list(proposals[:MAX_PROPOSALS_PER_CYCLE])
     overflow = list(proposals[MAX_PROPOSALS_PER_CYCLE:])
 
+    # Dedup within the accepted slice BEFORE validation: last occurrence
+    # of a given key wins (positional order of the raw slice is otherwise
+    # preserved); earlier occurrences are rejected outright as superseded
+    # so a key can never appear twice across (applied, rejected).
+    last_index_for_key: dict[str, int] = {}
+    for i, p in enumerate(accepted):
+        last_index_for_key[p.get("key")] = i
+
+    superseded: list = []
+    deduped_accepted: list = []
+    for i, p in enumerate(accepted):
+        key = p.get("key")
+        if last_index_for_key.get(key) != i:
+            superseded.append(p)
+        else:
+            deduped_accepted.append(p)
+    accepted = deduped_accepted
+
     # key -> (final_value, clamped, original_value)
     resolved: dict[str, tuple[float, bool, Any]] = {}
     # key -> (rejection_reason_code, message)
@@ -219,6 +237,14 @@ def validate_and_clamp(
             "value": p.get("value"),
             "reason": f"cycle limit exceeded (max {MAX_PROPOSALS_PER_CYCLE} proposals per cycle)",
             "rejection_reason": "cycle_limit_exceeded",
+        })
+
+    for p in superseded:
+        rejected.append({
+            "key": p.get("key"),
+            "value": p.get("value"),
+            "reason": "duplicate key in same cycle; a later proposal for this key supersedes it",
+            "rejection_reason": "duplicate_key_superseded",
         })
 
     return applied, rejected
