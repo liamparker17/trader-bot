@@ -14,6 +14,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Callable, Optional
 
 from src.config import Config
+from src.manager.events import drop_manager_event
 from src.risk.ratchet_floor import RatchetFloor
 
 logger = logging.getLogger("traderbot.risk.drawdown")
@@ -95,6 +96,12 @@ class DrawdownTracker:
         self.daily_drawdowns: list[dict] = []
         self.max_drawdown_pct: float = 0.0
 
+        # Manager event-drop: intraday drawdown > threshold fires an
+        # out-of-band manager cycle. Gated to once per session day so a
+        # sustained drawdown doesn't flood control/manager_events/.
+        self.manager_event_drawdown_pct = config.get("manager.event_triggers.drawdown_pct", 2.0)
+        self._drawdown_event_fired_for_date: Optional[datetime] = None
+
     def initialize(self, balance: float):
         """Set initial state. Call once at startup."""
         self.high_water_mark = balance
@@ -164,6 +171,15 @@ class DrawdownTracker:
                 violations.append(
                     f"Daily drawdown {daily_dd:.1%} >= limit {self.daily_limit:.1%}"
                 )
+
+            if daily_dd * 100 >= self.manager_event_drawdown_pct:
+                today = self.current_date
+                if self._drawdown_event_fired_for_date != today:
+                    self._drawdown_event_fired_for_date = today
+                    drop_manager_event(
+                        "drawdown",
+                        {"daily_drawdown_pct": round(daily_dd * 100, 3)},
+                    )
 
         # Weekly drawdown
         weekly_dd = 0.0
