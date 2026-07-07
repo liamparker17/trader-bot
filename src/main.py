@@ -15,26 +15,94 @@ import time
 import logging
 import logging.handlers
 import threading
+from datetime import datetime, timezone
+from typing import Callable, Optional
 from pathlib import Path
 
 from src.config import load_config
+from src.utils.instance_lock import InstanceLock
 from src.data.mt5_client import MT5Client
 from src.data.collector import DataCollector
 from src.indicators.engine import IndicatorEngine
 from src.ml.predictor import Predictor
 from src.ml.evaluator import Evaluator
 from src.risk.manager import RiskManager, TradeRequest
+from src.risk.drawdown_tracker import session_boundary
 from src.execution.executor import Executor
 from src.growth.reinvestment import GrowthManager
 from src.growth.milestone_tracker import MilestoneTracker
 from src.monitoring.trade_journal import TradeJournal
 from src.monitoring.performance import PerformanceTracker
 from src.monitoring.telegram_bot import TelegramBot
-from src.ai.analyst import AIAnalyst
-from src.ai.shadow_trader import ShadowTrader
-from src.ai.approval_queue import ApprovalQueue
+from src.control.effective_config import EffectiveConfig
+from src.control.queue import ControlQueue
 
 logger = logging.getLogger("traderbot")
+
+
+class DailySummaryScheduler:
+    """
+    Decides when the once-daily Telegram summary is due, at the same
+    trading session boundary (default 21:00 UTC) used elsewhere for
+    daily/weekly drawdown resets (see `session_boundary()` in
+    drawdown_tracker.py).
+
+    Config fallback chain (matches Task 4's session-boundary pattern):
+        trading.session_reset_hour_utc -> risk.session_boundary_hour_utc -> 21
+
+    Guards against double-firing two ways:
+    - An in-memory `last fired` boundary date, for the common case of a
+      single long-running process.
+    - A persisted journal event row (event_type="daily_summary_sent"),
+      so a process restart shortly after the boundary doesn't re-send.
+    """
+
+    EVENT_TYPE = "daily_summary_sent"
+
+    def __init__(self, config, journal, clock: Optional[Callable[[], datetime]] = None):
+        self.config = config
+        self.journal = journal
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.reset_hour = config.get(
+            "trading.session_reset_hour_utc",
+            config.get("risk.session_boundary_hour_utc", 21),
+        )
+        self._last_fired_date: Optional[str] = None
+
+    def due(self) -> Optional[str]:
+        """
+        Return the boundary date string ("YYYY-MM-DD") if a summary is
+        due and hasn't already been sent for that boundary, else None.
+        """
+        now = self.clock()
+        boundary = session_boundary(now, self.reset_hour)
+        boundary_date = boundary.date().isoformat()
+
+        if self._last_fired_date == boundary_date:
+            return None
+
+        # Survive process restarts: check the journal for a prior
+        # daily_summary_sent event recorded for this boundary date.
+        try:
+            events = self.journal.get_events(event_type=self.EVENT_TYPE, limit=10)
+            if events is not None and not events.empty and "message" in events.columns:
+                if boundary_date in set(events["message"]):
+                    self._last_fired_date = boundary_date
+                    return None
+        except Exception as e:
+            logger.debug(f"DailySummaryScheduler: journal lookback failed: {e}")
+
+        return boundary_date
+
+    def mark_fired(self, boundary_date: str):
+        """Record that the summary for `boundary_date` has been sent."""
+        self._last_fired_date = boundary_date
+        try:
+            self.journal.record_event(
+                self.EVENT_TYPE, boundary_date, {"boundary_date": boundary_date}
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record {self.EVENT_TYPE} event: {e}")
 
 
 class TraderBot:
@@ -57,15 +125,36 @@ class TraderBot:
         self.journal = None
         self.performance = None
         self.telegram = None
-        self.analyst = None
-        self.shadow = None
-        self.approval_queue = None
+        self.instance_lock = InstanceLock()
+        self.daily_summary_scheduler = None
+        self.effective_config = None
+        self.control_queue = None
+
+        # Main-loop catch-all (item S): rate-limit Telegram alerts to at
+        # most one per exception type every N seconds, so a repeatedly
+        # failing iteration doesn't spam Telegram.
+        self._loop_error_last_alert: dict = {}
+        self._loop_error_cooldown_seconds = 300
+
+        # Task 8: consecutive balance/equity refresh failures — escalated
+        # from debug to warning after 3 in a row, reset to 0 on success.
+        self._balance_refresh_failures = 0
 
     def setup(self):
         """Initialize all modules."""
         logger.info("Initializing TraderBot...")
         logger.info(f"Environment: {self.config.broker_environment}")
         logger.info(f"Instruments: {self.config.get_enabled_instruments()}")
+
+        # Single-instance lock — must succeed before any MT5 connection
+        # is attempted, so two bot processes can never trade the same
+        # account concurrently.
+        if not self.instance_lock.acquire():
+            logger.critical(
+                "Could not acquire single-instance lock. "
+                "Another TraderBot process appears to be running. Exiting."
+            )
+            sys.exit(1)
 
         # Validate credentials
         if not self.config.mt5_login:
@@ -87,11 +176,7 @@ class TraderBot:
         self.journal = TradeJournal(self.config)
         self.performance = PerformanceTracker(self.journal)
         self.telegram = TelegramBot(self.config)
-
-        # AI Analyst (optional Claude layer)
-        self.analyst = AIAnalyst(self.config)
-        self.approval_queue = ApprovalQueue(self.config)
-        self.shadow = ShadowTrader(self.config, self.analyst)
+        self.daily_summary_scheduler = DailySummaryScheduler(self.config, self.journal)
 
         # Data collector with candle callback
         self.collector = DataCollector(
@@ -106,8 +191,35 @@ class TraderBot:
         )
         self.growth = GrowthManager(self.config)
 
-        # Executor
-        self.executor = Executor(self.config, self.client, self.risk_manager)
+        # Executor — wire a best-effort Telegram alert callback so
+        # close_all()'s per-batch alert (including any close failures)
+        # actually reaches the operator in production.
+        self.executor = Executor(
+            self.config, self.client, self.risk_manager,
+            alert_callback=self._on_executor_alert,
+        )
+
+        # EffectiveConfig overlay (Task 8): settings.yaml <+ tunes overlay
+        # <+ safety_floor.yaml (last wins). Read through it at the
+        # whitelisted use sites so a `tb tune` command takes effect on the
+        # next read, no restart required.
+        self.effective_config = EffectiveConfig.load()
+        self.risk_manager.sizer.effective_config = self.effective_config
+        self.predictor.effective_config = self.effective_config
+
+        # Control queue (Task 8): polls control/inbox/*.cmd.json once per
+        # main-loop iteration for pause/resume/tune/revert/status_snapshot
+        # commands from the `tb` CLI (Task 11+).
+        self.control_queue = ControlQueue(
+            config=self.config,
+            journal=self.journal,
+            telegram=self.telegram,
+            risk_manager=self.risk_manager,
+            effective_config=self.effective_config,
+            collector=self.collector,
+            executor=self.executor,
+            client=self.client,
+        )
 
         # Load ML model
         if not self.predictor.load_model():
@@ -124,7 +236,7 @@ class TraderBot:
         except Exception as e:
             logger.error(f"Failed to get account balance: {e}")
             logger.info("Continuing with configured starting balance...")
-            starting = self.config.get("account.starting_balance", 500)
+            starting = self.config.get("account.starting_balance_zar", 500)
             self.risk_manager.initialize(starting)
             self.growth.initialize(starting)
 
@@ -161,70 +273,81 @@ class TraderBot:
         )
         recon_thread.start()
 
-        # Start Telegram command listener for /approve, /reject, /pending, /shadow
-        if self.telegram and self.approval_queue:
-            self.telegram.start_command_listener(
-                approval_queue=self.approval_queue,
-                shadow_trader=self.shadow,
-            )
-
-        # AI Analyst: pre-session briefing
-        if self.analyst.is_active:
-            try:
-                instruments = self.config.get_enabled_instruments()
-                balance = self.client.get_account_balance()
-                briefing = self.analyst.session_briefing(
-                    session="startup",
-                    instruments=instruments,
-                    market_data={},  # Will be populated once candles are available
-                    balance=balance,
-                )
-                if briefing:
-                    logger.info(f"AI Session Briefing: regime={briefing.get('regime', 'unknown')}")
-                    for inst, bias in briefing.get("bias", {}).items():
-                        logger.info(f"  {inst}: {bias}")
-                    self.telegram._send(
-                        f"<b>AI Briefing:</b> {briefing.get('regime', '?')} regime\n"
-                        + "\n".join(f"  {k}: {v}" for k, v in briefing.get("bias", {}).items())
-                    )
-            except Exception as e:
-                logger.debug(f"AI briefing skipped: {e}")
-
         last_status_log = 0
+        last_balance_check = 0.0
+        cached_balance = None
+        cached_equity = None
         try:
             while self.running:
-                # Main loop runs at ~1 second intervals
-                # Actual trading decisions happen in _on_candle_complete callback
-                time.sleep(1)
+                # Catch-all for a single iteration: an unhandled exception
+                # here must never kill the loop silently. Log the full
+                # traceback, fire a rate-limited Telegram alert, and let
+                # the loop continue on the next iteration.
+                try:
+                    # Main loop runs at ~1 second intervals
+                    # Actual trading decisions happen in _on_candle_complete callback
+                    time.sleep(1)
 
-                # Hourly performance status log
-                now = time.time()
-                if now - last_status_log >= 3600:
-                    last_status_log = now
-                    try:
-                        bal = self.client.get_account_balance()
-                        summary = self.performance.get_summary()
-                        logger.info(
-                            f"[STATUS] Balance: ${bal:.2f} | "
-                            f"Trades: {summary.get('total_trades', 0)} | "
-                            f"WR: {summary.get('win_rate', 0):.1%} | "
-                            f"PnL: ${summary.get('total_pnl', 0):.2f} | "
-                            f"PF: {summary.get('profit_factor', 0):.2f}"
+                    # Control queue (Task 8): process any pending
+                    # pause/resume/tune/revert/status_snapshot commands.
+                    # Wrapped separately so a queue-processing bug can
+                    # never take down the trading loop.
+                    if self.control_queue is not None:
+                        try:
+                            self.control_queue.poll_once()
+                        except Exception as e:
+                            logger.error(f"Control queue poll failed: {e}", exc_info=True)
+
+                    # Hourly performance status log
+                    now = time.time()
+                    if now - last_status_log >= 3600:
+                        last_status_log = now
+                        try:
+                            bal = self.client.get_account_balance()
+                            summary = self.performance.get_summary()
+                            logger.info(
+                                f"[STATUS] Balance: ${bal:.2f} | "
+                                f"Trades: {summary.get('total_trades', 0)} | "
+                                f"WR: {summary.get('win_rate', 0):.1%} | "
+                                f"PnL: ${summary.get('total_pnl', 0):.2f} | "
+                                f"PF: {summary.get('profit_factor', 0):.2f}"
+                            )
+                        except Exception:
+                            pass
+
+                    # Refresh cached balance/equity every 5s (not every ~1s
+                    # iteration) so the emergency checks below don't hammer
+                    # account_info on the broker.
+                    if now - last_balance_check >= 5:
+                        last_balance_check = now
+                        cached_balance, cached_equity = self._refresh_balance_cache(
+                            cached_balance, cached_equity
                         )
-                    except Exception:
-                        pass
 
-                # Check for emergency shutdown
-                if self.risk_manager.close_all_signal():
-                    logger.critical("Emergency shutdown signal — closing all positions")
-                    results = self.executor.close_all("emergency_shutdown")
-                    try:
-                        balance = self.client.get_account_balance()
-                        self.telegram.emergency_stop(balance, "Hard floor breach")
-                    except Exception:
-                        pass
-                    self.running = False
-                    break
+                    # Session boundary (21:00 UTC) reset + daily-drawdown
+                    # emergency check, skipped while broker_down (stale
+                    # cached_balance/cached_equity). See
+                    # _check_session_and_drawdown() docstring for details,
+                    # including its own isolated exception handling.
+                    if cached_balance is not None and not self.collector.broker_down:
+                        self._check_session_and_drawdown(cached_balance, cached_equity)
+
+                    # Check for PERMANENT emergency shutdown (hard floor breach /
+                    # circuit-breaker shutdown) — distinct from the resumable
+                    # daily-drawdown block above. Stops the bot entirely.
+                    if self.risk_manager.close_all_signal():
+                        logger.critical("Emergency shutdown signal — closing all positions")
+                        results = self.executor.close_all("emergency_shutdown")
+                        try:
+                            balance = self.client.get_account_balance()
+                            self.telegram.emergency_stop(balance, "Hard floor breach")
+                        except Exception:
+                            pass
+                        self.running = False
+                        break
+
+                except Exception as e:
+                    self._handle_loop_exception(e)
 
         except Exception as e:
             logger.critical(f"Unhandled exception in main loop: {e}", exc_info=True)
@@ -241,6 +364,15 @@ class TraderBot:
             return
 
         if not self.running:
+            return
+
+        # Task 8: skip new-entry evaluation entirely while the broker
+        # connection is down — the health thread hasn't confirmed a fresh
+        # price/account feed, so any signal here would be evaluated
+        # against stale data. Debug-level only: this can fire every
+        # candle during an outage and must not spam the log.
+        if self.collector.broker_down:
+            logger.debug(f"Skipping signal evaluation for {instrument}: broker_down")
             return
 
         try:
@@ -307,11 +439,6 @@ class TraderBot:
         pip_location = inst_config.get("pip_location", -4) if inst_config else -4
         pip_size = 10 ** pip_location
 
-        # === Execute any user-approved Claude recommendations ===
-        current_price = float(m1_df.iloc[-1]["close"])
-        if self.approval_queue:
-            self._execute_approved_trades(instrument, current_price, features)
-
         # === PER-INSTRUMENT STRATEGY DISPATCH ===
         strategy = inst_config.get("strategy", "pullback") if inst_config else "pullback"
         direction = None
@@ -358,52 +485,6 @@ class TraderBot:
         atr_ratio = features.get("atr_ratio", 1.0)
         if atr_value <= 0:
             return
-
-        # --- AI Analyst review (optional) ---
-        if self.analyst.is_active:
-            try:
-                balance = self.client.get_account_balance()
-                daily_pnl = self.performance.get_summary().get("total_pnl", 0.0)
-                open_positions = [
-                    {"instrument": t.instrument, "direction": t.direction,
-                     "entry_price": t.entry_price, "unrealized_pnl": t.current_pnl}
-                    for t in self.executor.open_trades.values()
-                ] if self.executor.open_trades else []
-
-                review = self.analyst.review_trade(
-                    instrument=instrument,
-                    direction=direction,
-                    ml_confidence=ml_confidence,
-                    features=features,
-                    open_positions=open_positions,
-                    daily_pnl=daily_pnl,
-                    balance=balance,
-                    atr_value=atr_value,
-                    spread=spread,
-                )
-
-                if review["source"] == "ai_analyst":
-                    logger.info(
-                        f"AI Review: {'APPROVED' if review['approved'] else 'REJECTED'} "
-                        f"({review['confidence']:.0%}) — {review['reasoning']}"
-                    )
-                    if review.get("warnings"):
-                        for w in review["warnings"]:
-                            logger.warning(f"AI Warning: {w}")
-
-                    require_approval = self.config.get("ai_analyst.require_approval", False)
-                    if not review["approved"] and require_approval:
-                        logger.info(f"Trade BLOCKED by AI Analyst: {instrument} {direction}")
-                        return
-
-                    # Apply size modification if suggested
-                    size_mult = review.get("modifications", {}).get("reduce_size")
-                    if size_mult and isinstance(size_mult, (int, float)) and 0 < size_mult < 1:
-                        atr_ratio = atr_ratio * size_mult
-                        logger.info(f"AI Analyst reduced position size by {size_mult:.0%}")
-
-            except Exception as e:
-                logger.debug(f"AI review skipped: {e}")
 
         # Execute through the executor (which goes through risk manager)
         trade = self.executor.execute_signal(
@@ -711,118 +792,6 @@ class TraderBot:
             return rsi > rsi_os and bb_pos > 0.15 and divergence != 1
         return False
 
-    def _send_shadow_summary(self, result: dict):
-        """Send shadow retrospective results via Telegram."""
-        shadow_pnl = result.get("shadow_pnl_pips", 0)
-        bot_pnl = result.get("bot_pnl_pips", 0)
-        shadow_emoji = "\u2705" if shadow_pnl > 0 else "\U0001f534"
-        bot_emoji = "\u2705" if bot_pnl > 0 else "\U0001f534"
-
-        text = (
-            f"\U0001f9e0 <b>Claude Shadow Report — {result['date']}</b>\n\n"
-            f"<b>Claude's Trades (paper):</b>\n"
-            f"  Trades: {result['shadow_total']} "
-            f"({result['shadow_wins']}W / {result['shadow_losses']}L)\n"
-            f"  {shadow_emoji} PnL: {shadow_pnl:+.1f} pips\n\n"
-            f"<b>Bot's Actual Trades:</b>\n"
-            f"  Trades: {result['bot_trades']}\n"
-            f"  {bot_emoji} PnL: {bot_pnl:+.1f} pips\n\n"
-        )
-
-        diff = shadow_pnl - bot_pnl
-        if diff > 0:
-            text += f"\U0001f4a1 Claude was ahead by {diff:+.1f} pips today."
-        elif diff < 0:
-            text += f"\U0001f916 Bot was ahead by {abs(diff):.1f} pips today."
-        else:
-            text += "Dead even today."
-
-        # Show individual trades
-        trades = result.get("shadow_trades", [])
-        if trades:
-            text += "\n\n<b>Claude's Trades:</b>"
-            for t in trades[:5]:
-                pnl = t.get("pnl_pips", 0)
-                emoji = "\u2705" if pnl > 0 else "\u274c"
-                text += (
-                    f"\n{emoji} {t['instrument']} {t['direction'].upper()} "
-                    f"{pnl:+.1f} pips ({t.get('exit_reason', '?')})"
-                )
-
-        self.telegram._send(text)
-
-    def _execute_approved_trades(self, instrument: str, current_price: float, features: dict):
-        """Pick up user-approved Claude recommendations and execute them."""
-        try:
-            approved = self.approval_queue.get_approved_trades()
-            for trade in approved:
-                if trade.instrument != instrument:
-                    continue
-
-                # Check price hasn't moved too far from recommendation
-                inst_config = self.config.get_instrument(instrument)
-                pip_loc = inst_config.get("pip_location", -4) if inst_config else -4
-                pip_size = 10 ** pip_loc
-                max_slip = self.config.get("ai_analyst.approval_max_slippage_pips", 5)
-                slippage_pips = abs(current_price - trade.entry_price) / pip_size
-
-                if slippage_pips > max_slip:
-                    logger.info(
-                        f"Approved trade {trade.id} skipped: price moved "
-                        f"{slippage_pips:.1f} pips (max {max_slip})"
-                    )
-                    self.approval_queue.mark_executed(trade.id)
-                    continue
-
-                atr_value = features.get("atr_value", 0)
-                atr_ratio = features.get("atr_ratio", 1.0)
-                if atr_value <= 0:
-                    continue
-
-                logger.info(
-                    f"Executing approved Claude trade: {trade.id} | "
-                    f"{instrument} {trade.direction.upper()} | "
-                    f"Conf: {trade.confidence:.0%}"
-                )
-
-                result = self.executor.execute_signal(
-                    instrument=instrument,
-                    direction=trade.direction,
-                    ml_confidence=trade.confidence,
-                    atr_value=atr_value,
-                    atr_ratio=atr_ratio,
-                )
-
-                self.approval_queue.mark_executed(trade.id)
-
-                if result:
-                    self.journal.record_trade(
-                        trade_id=result.trade_id,
-                        instrument=result.instrument,
-                        direction=result.direction,
-                        units=result.units,
-                        entry_price=result.entry_price,
-                        entry_time=result.entry_time,
-                        stop_loss=result.stop_loss,
-                        take_profit=result.take_profit,
-                        ml_confidence=trade.confidence,
-                        model_version=f"claude_{trade.id}",
-                        trend_15min=int(features.get("trend_15min", 0)),
-                    )
-                    self.telegram.trade_opened(
-                        instrument=result.instrument,
-                        direction=result.direction,
-                        units=result.units,
-                        entry_price=result.entry_price,
-                        stop_loss=result.stop_loss,
-                        take_profit=result.take_profit,
-                        confidence=trade.confidence,
-                        risk_amount=result.risk_amount,
-                    )
-
-        except Exception as e:
-            logger.debug(f"Approved trade execution error: {e}")
-
     def _reconciliation_loop(self):
         """Background thread: sync with broker and check positions."""
         interval = self.config.get("monitoring.reconciliation_interval_seconds", 60)
@@ -834,27 +803,6 @@ class TraderBot:
                 balance = self.client.get_account_balance()
                 self.milestones.check(balance)
                 self.growth.update(balance)
-
-                # End-of-day shadow retrospective
-                from datetime import datetime as dt_cls, timezone as tz_cls
-                hour_utc = dt_cls.now(tz_cls.utc).hour
-                if self.shadow and self.shadow.should_run(hour_utc):
-                    try:
-                        logger.info("Running end-of-day shadow retrospective...")
-                        result = self.shadow.run_retrospective(
-                            collector=self.collector,
-                            engine=self.engine,
-                            journal=self.journal,
-                            mt5_client=self.client,
-                        )
-                        if result and self.telegram:
-                            self._send_shadow_summary(result)
-                    except Exception as e:
-                        logger.error(f"Shadow retrospective failed: {e}", exc_info=True)
-
-                # Expire pending approvals
-                if self.approval_queue:
-                    self.approval_queue.expire_old()
 
                 # Check ML retrain triggers
                 should_retrain, reason = self.evaluator.should_retrain()
@@ -871,6 +819,204 @@ class TraderBot:
         """Callback when a milestone is reached."""
         self.telegram.milestone_reached(milestone, balance, message)
         self.journal.record_event("milestone", message, {"milestone": milestone, "balance": balance})
+
+    def _on_executor_alert(self, event: str, data: dict):
+        """
+        Best-effort Telegram bridge for Executor alerts (close_all's batch
+        summary, and failed orders with no real MT5 ticket). Never allowed
+        to raise into the executor — a failed alert must not block
+        position management.
+        """
+        try:
+            if event == "close_all":
+                reason = data.get("reason", "unknown")
+                closed = data.get("closed", 0)
+                requested = data.get("requested", 0)
+                msg = f"close_all ({reason}): {closed}/{requested} positions closed"
+                failures = data.get("failures") or []
+                if failures:
+                    msg += f" | {len(failures)} FAILED: {failures}"
+                self.telegram._send(f"<b>Position close-all:</b> {msg}")
+                self.journal.record_event("close_all", msg, data)
+            elif event == "order_failed":
+                instrument = data.get("instrument", "?")
+                direction = data.get("direction", "?")
+                reason = data.get("reason", "unknown")
+                msg = f"Order failed for {instrument} {direction}: {reason} (no MT5 ticket returned)"
+                self.telegram._send(f"⚠️ <b>Order Failed</b>\n{msg}")
+                self.journal.record_event("order_failed", msg, data)
+        except Exception as e:
+            logger.error(f"_on_executor_alert failed: {e}")
+
+    def _refresh_balance_cache(self, cached_balance, cached_equity):
+        """
+        Refresh the cached balance/equity from the broker. On failure,
+        keeps the previous cached values (so callers keep working off the
+        last-known-good numbers) and escalates the log level from debug
+        to warning once 3 consecutive refreshes have failed — a single
+        blip shouldn't page anyone, but a sustained outage should be
+        visible. The counter resets to 0 on the next success.
+
+        Returns (balance, equity) — unchanged from the inputs on failure.
+        """
+        try:
+            summary = self.client.get_account_summary()
+            self._balance_refresh_failures = 0
+            return summary["balance"], summary["equity"]
+        except Exception as e:
+            self._balance_refresh_failures += 1
+            if self._balance_refresh_failures >= 3:
+                logger.warning(
+                    f"Balance/equity refresh failed "
+                    f"{self._balance_refresh_failures}x in a row: {e}"
+                )
+            else:
+                logger.debug(f"Balance/equity refresh failed: {e}")
+            return cached_balance, cached_equity
+
+    def _check_session_and_drawdown(self, cached_balance: float, cached_equity: float):
+        """
+        Session boundary (21:00 UTC) reset + daily-drawdown emergency
+        check — runs every iteration (via the main loop), independent of
+        whether a trade signal fired. Lifts the resumable daily block and
+        resets the consecutive-loss counter at the boundary; on a fresh
+        daily-drawdown breach, closes all positions but keeps the bot
+        RUNNING with entries blocked until the next boundary (see
+        RiskManager.entries_blocked). Also fires the once-per-day Telegram
+        summary at the same boundary.
+
+        Callers should skip calling this entirely while broker_down is
+        True (cached_balance/cached_equity would be stale) — see run().
+
+        This method has its OWN try/except, distinct from the generic
+        per-iteration catch-all (_handle_loop_exception): an exception
+        here specifically engages RiskManager's manual pause (blocking
+        new entries until a `resume` command or code fix + restart) and
+        sends a dedicated Telegram alert, rather than just being logged
+        and rate-limited like any other loop exception.
+        """
+        try:
+            self.risk_manager.check_session_boundary(cached_balance)
+            if self.risk_manager.check_drawdown_emergency(cached_balance, cached_equity):
+                logger.critical(
+                    "DAILY DRAWDOWN BREACH — closing all positions; "
+                    "bot stays running, entries blocked until next "
+                    "session boundary"
+                )
+                self.executor.close_all("daily_drawdown")
+                try:
+                    drawdown_pct = self.risk_manager.drawdown.get_daily_drawdown_pct(
+                        cached_balance
+                    )
+                    self.telegram.daily_stop(cached_balance, drawdown_pct)
+                except Exception:
+                    pass
+
+            self._maybe_send_daily_summary(cached_balance)
+        except Exception as e:
+            logger.error(
+                f"Session boundary / drawdown emergency check failed — "
+                f"pausing new entries: {e}",
+                exc_info=True,
+            )
+            self.risk_manager.set_manual_pause(
+                f"session boundary/drawdown check exception: {e}"
+            )
+            try:
+                self.telegram._send(
+                    f"<b>Session/drawdown check failed</b> — new entries paused: {e}"
+                )
+            except Exception:
+                pass
+
+    def _maybe_send_daily_summary(self, balance: float):
+        """
+        Fire the once-per-day Telegram summary at the 21:00 UTC session
+        boundary (or whatever `trading.session_reset_hour_utc` /
+        `risk.session_boundary_hour_utc` resolves to). Best-effort — must
+        never raise into the main loop.
+        """
+        if not self.daily_summary_scheduler:
+            return
+        try:
+            boundary_date = self.daily_summary_scheduler.due()
+            if boundary_date is None:
+                return
+
+            summary = self.performance.get_summary()
+
+            # Task 14 self-funding scorecard: manager activity since the
+            # session boundary + net-after-API-cost figures. Best-effort —
+            # never let scorecard math break the summary itself.
+            manager_kwargs = {}
+            try:
+                now = datetime.now(timezone.utc)
+                boundary_hour = self.config.get(
+                    "trading.session_reset_hour_utc",
+                    self.config.get("risk.session_boundary_hour_utc", 21),
+                )
+                day_start = now.replace(
+                    hour=boundary_hour, minute=0, second=0, microsecond=0)
+                if day_start > now:
+                    day_start -= timedelta(days=1)
+                stats = self.performance.manager_stats_since(day_start)
+                if stats["cycles"] > 0 or self.performance.days_since_first_manager_cycle(now) is not None:
+                    manager_kwargs = {
+                        "manager_cycles": stats["cycles"],
+                        "manager_adjustments": stats["adjustments_applied"],
+                        "api_cost_today": stats["api_cost_zar"],
+                        "net_after_cost_today": self.performance.net_pnl_after_api(days=1),
+                        "net_after_cost_total": self.performance.net_pnl_after_api(),
+                    }
+                    days_running = self.performance.days_since_first_manager_cycle(now)
+                    if days_running is not None and days_running >= 8:
+                        report = self.performance.justification_report()
+                        manager_kwargs["verdict_line"] = (
+                            f"{report['verdict']} — {report['reason']}"
+                        )
+            except Exception as e:
+                logger.warning(f"Daily summary manager scorecard failed: {e}")
+
+            self.telegram.daily_summary(
+                date=boundary_date,
+                trades=summary.get("total_trades", 0),
+                wins=summary.get("wins", 0),
+                losses=summary.get("losses", 0),
+                pnl=summary.get("total_pnl", 0.0),
+                balance=balance,
+                win_rate=summary.get("win_rate", 0.0),
+                max_drawdown=summary.get("max_drawdown_pct", 0.0),
+                **manager_kwargs,
+            )
+            self.daily_summary_scheduler.mark_fired(boundary_date)
+        except Exception as e:
+            logger.error(f"Daily summary failed: {e}")
+
+    def _handle_loop_exception(self, exc: Exception):
+        """
+        Catch-all for an unhandled exception inside a single main-loop
+        iteration (item S). Logs the full traceback, sends a Telegram
+        alert rate-limited to once per 5 minutes per exception type, and
+        lets the loop continue — a single bad iteration must never kill
+        the bot silently.
+        """
+        exc_type = type(exc).__name__
+        logger.error(
+            f"Unhandled exception in main loop iteration ({exc_type}): {exc}",
+            exc_info=True,
+        )
+
+        now = time.time()
+        last_alert = self._loop_error_last_alert.get(exc_type, 0.0)
+        if now - last_alert >= self._loop_error_cooldown_seconds:
+            self._loop_error_last_alert[exc_type] = now
+            try:
+                self.telegram.bot_error(exc_type, str(exc))
+                self.journal.record_event(
+                    "bot_error", str(exc), {"exception_type": exc_type}
+                )
+            except Exception as e:
+                logger.error(f"_handle_loop_exception alert failed: {e}")
 
     def fetch_historical_data(self):
         """Fetch and cache historical data for all instruments."""
@@ -917,6 +1063,10 @@ class TraderBot:
         # Close API sessions
         if self.client:
             self.client.close()
+
+        # Release single-instance lock last, once everything else is torn down
+        if self.instance_lock:
+            self.instance_lock.release()
 
         logger.info("TraderBot shutdown complete.")
 

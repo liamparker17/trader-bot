@@ -46,6 +46,13 @@ class PositionSizer:
         self.consec_loss_reduce = config.get("risk.consecutive_loss_reduce_at", 3)
         self.high_vol_ratio = config.get("risk.high_volatility_atr_ratio", 2.0)
 
+        # Optional EffectiveConfig overlay (Task 8): when set, the global
+        # risk-per-trade fallback is read through it so a `tb tune` command
+        # takes effect on the next sizing call without a restart. Per-
+        # instrument risk_per_trade_pct overrides in instruments.yaml still
+        # take priority, matching the pre-existing fallback order.
+        self.effective_config = None
+
     def calculate(
         self,
         balance: float,
@@ -86,7 +93,12 @@ class PositionSizer:
         # Per-instrument SL/TP/risk overrides (fall back to global config)
         inst_sl_atr_mult = inst_config.get("sl_atr_multiplier", self.sl_atr_mult)
         inst_tp_atr_mult = inst_config.get("tp_atr_multiplier", self.tp_atr_mult)
-        inst_risk_pct = inst_config.get("risk_per_trade_pct", self.risk_pct * 100) / 100
+        global_risk_pct = self.risk_pct
+        if self.effective_config is not None:
+            global_risk_pct = (
+                self.effective_config.get("risk.risk_per_trade_pct", self.risk_pct * 100) / 100
+            )
+        inst_risk_pct = inst_config.get("risk_per_trade_pct", global_risk_pct * 100) / 100
 
         # Step 1: Calculate SL distance in pips
         sl_pips = atr_value * inst_sl_atr_mult / pip_size
@@ -101,6 +113,20 @@ class PositionSizer:
         risk_amount = balance * inst_risk_pct
 
         adjustments = []
+
+        # Step 3.5: Per-instrument weight multiplier (Task 10). Read through
+        # EffectiveConfig at use time so a `tb tune weight.<INSTRUMENT>`
+        # takes effect on the next sizing call without a restart. Defaults
+        # to 1.0 (no change) when unset. Applied BEFORE the size calc; all
+        # downstream clamps (leverage cap, min/max SL, round DOWN) still
+        # apply afterwards, so a weight > 1.0 can never breach those limits.
+        # weight == 0.0 is handled upstream by RiskManager, which rejects
+        # the trade before calling calculate() at all — but we still guard
+        # here defensively in case calculate() is ever called directly.
+        weight = self.get_weight(instrument)
+        if weight != 1.0:
+            risk_amount *= weight
+            adjustments.append(f"weight_{weight:.2f}x")
 
         # Step 4: Consecutive loss adjustment
         if consecutive_losses >= self.consec_loss_reduce:
@@ -184,6 +210,17 @@ class PositionSizer:
         )
 
         return result
+
+    def get_weight(self, instrument: str) -> float:
+        """
+        Read `weight.<INSTRUMENT>` through the EffectiveConfig overlay
+        (Task 10). Defaults to 1.0 (no scaling) when no EffectiveConfig is
+        wired or the key isn't set. Shared by RiskManager so it can reject
+        muted (weight == 0.0) instruments before sizing is even attempted.
+        """
+        if self.effective_config is None:
+            return 1.0
+        return self.effective_config.get(f"weight.{instrument}", 1.0)
 
     def _pip_value_zar(self, instrument: str, price: float, pip_size: float) -> float:
         """

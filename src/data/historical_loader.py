@@ -13,6 +13,7 @@ import pandas as pd
 
 from src.config import Config, DATA_DIR
 from src.data.mt5_client import MT5Client
+from src.utils.timeutil import to_utc
 
 logger = logging.getLogger("traderbot.historical")
 
@@ -156,7 +157,7 @@ class HistoricalLoader:
                 continue
 
             rows.append({
-                "timestamp": pd.Timestamp(c["time"]),
+                "timestamp": to_utc(pd.Timestamp(c["time"])),
                 "open": float(mid["o"]),
                 "high": float(mid["h"]),
                 "low": float(mid["l"]),

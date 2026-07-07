@@ -80,7 +80,7 @@ def show_overview(config, journal, perf):
     # Key metrics in columns
     col1, col2, col3, col4 = st.columns(4)
 
-    starting = config.get("account.starting_balance", 500)
+    starting = config.get("account.starting_balance_zar", 500)
     balance = starting + summary["total_pnl"]
 
     col1.metric("Balance", f"${balance:.2f}", f"${summary['total_pnl']:+.2f}")

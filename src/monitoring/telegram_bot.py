@@ -46,6 +46,7 @@ class TelegramBot:
         self.alert_retrain = config.get("telegram.alert_on_ml_retrain", True)
         self.alert_api_error = config.get("telegram.alert_on_api_error", True)
         self.alert_milestone = config.get("telegram.alert_on_milestone", True)
+        self.alert_bot_error = config.get("telegram.alert_on_bot_error", True)
 
         if self.enabled and (not self.token or not self.chat_id):
             logger.warning("Telegram enabled but token/chat_id not set. Alerts disabled.")
@@ -222,6 +223,25 @@ class TelegramBot:
         )
         self._send(text)
 
+    def bot_error(self, exc_type: str, message: str):
+        """
+        Alert: unhandled exception caught by the main-loop catch-all.
+        Best-effort \u2014 must never raise into the caller (the whole point of
+        this alert is to survive errors, so a broken send path can't be
+        allowed to take the loop down too).
+        """
+        if not self.alert_bot_error:
+            return
+        try:
+            text = (
+                f"\U0001f6a8 <b>Bot Error</b>\n"
+                f"Type: {exc_type}\n"
+                f"{message}"
+            )
+            self._send(text)
+        except Exception as e:
+            logger.warning(f"bot_error alert failed: {e}")
+
     def bot_started(self, balance: float, environment: str):
         """Alert: bot started."""
         text = (
@@ -241,222 +261,61 @@ class TelegramBot:
         self._send(text)
 
     # ------------------------------------------------------------------
+    # MT5 connectivity alerts
+    # ------------------------------------------------------------------
+
+    def mt5_connected(self, environment: str = ""):
+        """Alert: MT5 broker connection established. Best-effort, never raises."""
+        try:
+            text = "\U0001f7e2 <b>MT5 Connected</b>"
+            if environment:
+                text += f"\nEnvironment: {environment}"
+            self._send(text)
+        except Exception as e:
+            logger.warning(f"mt5_connected alert failed: {e}")
+
+    def mt5_disconnected(self, reason: str = "connection lost"):
+        """Alert: MT5 broker connection lost, new entries paused. Best-effort, never raises."""
+        try:
+            text = (
+                f"\U0001f6ab <b>MT5 Disconnected</b>\n"
+                f"Reason: {reason}\n"
+                f"New entries paused until reconnect."
+            )
+            self._send(text)
+        except Exception as e:
+            logger.warning(f"mt5_disconnected alert failed: {e}")
+
+    def mt5_reconnected(self):
+        """Alert: MT5 broker connection restored, trading resumed. Best-effort, never raises."""
+        try:
+            text = (
+                "✅ <b>MT5 Reconnected</b>\n"
+                f"Trading resumed."
+            )
+            self._send(text)
+        except Exception as e:
+            logger.warning(f"mt5_reconnected alert failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Claude manager
+    # ------------------------------------------------------------------
+
+    def manager_cycle(self, summary: str):
+        """
+        Alert: one Claude-manager cycle finished (or was skipped/failed).
+        `summary` is a pre-formatted one-line-ish string, e.g.
+        "[MANAGER] cycle: 2 applied, 1 clamped — rationale...". Best-effort,
+        never raises.
+        """
+        try:
+            self._send(f"\U0001f9e0 {summary}")
+        except Exception as e:
+            logger.warning(f"manager_cycle alert failed: {e}")
+
+    # ------------------------------------------------------------------
     # Reports
     # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # AI Analyst alerts
-    # ------------------------------------------------------------------
-
-    def claude_recommendation(
-        self,
-        trade_id: str,
-        instrument: str,
-        direction: str,
-        entry_price: float,
-        stop_loss: float,
-        take_profit: float,
-        confidence: float,
-        reasoning: str,
-        ttl_seconds: int,
-    ):
-        """Alert: Claude recommends a trade, awaiting approval."""
-        emoji = "\U0001f7e2" if direction == "buy" else "\U0001f534"
-        arrow = "\u2191" if direction == "buy" else "\u2193"
-
-        text = (
-            f"\U0001f9e0 <b>CLAUDE RECOMMENDS</b>\n\n"
-            f"{emoji} <b>{direction.upper()}</b> {instrument}\n"
-            f"{arrow} Entry: {entry_price:.5f}\n"
-            f"\U0001f6d1 SL: {stop_loss:.5f}\n"
-            f"\U0001f3af TP: {take_profit:.5f}\n"
-            f"\U0001f4ca Confidence: {confidence:.0%}\n\n"
-            f"<i>{reasoning}</i>\n\n"
-            f"\u23f0 Expires in {ttl_seconds // 60} min\n\n"
-            f"Reply:\n"
-            f"<code>/approve {trade_id}</code>\n"
-            f"<code>/reject {trade_id}</code>"
-        )
-        self._send(text)
-
-    def claude_shadow_result(
-        self,
-        instrument: str,
-        direction: str,
-        pnl_pips: float,
-        confidence: float,
-        exit_reason: str,
-    ):
-        """Alert: shadow trade result (paper P&L)."""
-        if pnl_pips > 0:
-            emoji = "\u2705"
-            label = "WIN"
-        else:
-            emoji = "\u274c"
-            label = "LOSS"
-
-        text = (
-            f"\U0001f9e0 <b>SHADOW {label}</b> {instrument} {direction.upper()}\n"
-            f"{emoji} {pnl_pips:+.1f} pips (paper)\n"
-            f"Confidence: {confidence:.0%} | Exit: {exit_reason}"
-        )
-        self._send(text)
-
-    # ------------------------------------------------------------------
-    # Command polling (for /approve, /reject, /shadow, /pending)
-    # ------------------------------------------------------------------
-
-    def start_command_listener(self, approval_queue, shadow_trader=None):
-        """
-        Start a background thread that polls for Telegram commands.
-
-        Supports:
-            /approve <id>  - Approve a pending Claude recommendation
-            /reject <id>   - Reject a pending recommendation
-            /pending       - List pending recommendations
-            /shadow        - Show shadow trader performance
-            /ai            - Show AI analyst stats
-        """
-        if not self.enabled:
-            return
-
-        self._approval_queue = approval_queue
-        self._shadow_trader = shadow_trader
-        self._last_update_id = 0
-
-        thread = threading.Thread(
-            target=self._command_poll_loop,
-            daemon=True,
-            name="telegram_commands",
-        )
-        thread.start()
-        logger.info("Telegram command listener started.")
-
-    def _command_poll_loop(self):
-        """Poll Telegram for commands every 2 seconds."""
-        import time
-        while True:
-            try:
-                self._poll_updates()
-            except Exception as e:
-                logger.debug(f"Telegram poll error: {e}")
-            time.sleep(2)
-
-    def _poll_updates(self):
-        """Fetch and process new Telegram messages."""
-        url = f"https://api.telegram.org/bot{self.token}/getUpdates"
-        params = {"offset": self._last_update_id + 1, "timeout": 1}
-
-        try:
-            resp = requests.get(url, params=params, timeout=5)
-            if resp.status_code != 200:
-                return
-            data = resp.json()
-            if not data.get("ok"):
-                return
-        except Exception:
-            return
-
-        for update in data.get("result", []):
-            self._last_update_id = update["update_id"]
-            message = update.get("message", {})
-            text = message.get("text", "").strip()
-            chat_id = message.get("chat", {}).get("id")
-
-            # Only respond to our configured chat
-            if str(chat_id) != str(self.chat_id):
-                continue
-
-            if text.startswith("/approve "):
-                trade_id = text.split(" ", 1)[1].strip()
-                self._handle_approve(trade_id)
-            elif text.startswith("/reject "):
-                trade_id = text.split(" ", 1)[1].strip()
-                self._handle_reject(trade_id)
-            elif text == "/pending":
-                self._handle_pending()
-            elif text == "/shadow":
-                self._handle_shadow()
-
-    def _handle_approve(self, trade_id: str):
-        """Process /approve command."""
-        if not hasattr(self, "_approval_queue") or not self._approval_queue:
-            self._send("Approval queue not available.")
-            return
-
-        trade = self._approval_queue.approve(trade_id)
-        if trade:
-            self._send(
-                f"\u2705 <b>APPROVED:</b> {trade.instrument} {trade.direction.upper()}\n"
-                f"Will execute on next candle if price is still valid."
-            )
-        else:
-            self._send(f"\u274c Trade <code>{trade_id}</code> not found or expired.")
-
-    def _handle_reject(self, trade_id: str):
-        """Process /reject command."""
-        if not hasattr(self, "_approval_queue") or not self._approval_queue:
-            self._send("Approval queue not available.")
-            return
-
-        if self._approval_queue.reject(trade_id):
-            self._send(f"\U0001f6ab <b>REJECTED:</b> <code>{trade_id}</code>")
-        else:
-            self._send(f"\u274c Trade <code>{trade_id}</code> not found.")
-
-    def _handle_pending(self):
-        """Process /pending command."""
-        if not hasattr(self, "_approval_queue") or not self._approval_queue:
-            self._send("Approval queue not available.")
-            return
-
-        pending = self._approval_queue.get_pending_summary()
-        if not pending:
-            self._send("No pending recommendations.")
-            return
-
-        lines = ["\U0001f9e0 <b>Pending Recommendations:</b>\n"]
-        for p in pending:
-            remaining = int(p["time_remaining"])
-            lines.append(
-                f"\u2022 <code>{p['id']}</code>\n"
-                f"  {p['instrument']} {p['direction'].upper()} "
-                f"@ {p['entry_price']:.5f}\n"
-                f"  Conf: {p['confidence']:.0%} | "
-                f"Expires: {remaining // 60}m {remaining % 60}s"
-            )
-        self._send("\n".join(lines))
-
-    def _handle_shadow(self):
-        """Process /shadow command."""
-        if not hasattr(self, "_shadow_trader") or not self._shadow_trader:
-            self._send("Shadow trader not available.")
-            return
-
-        perf = self._shadow_trader.get_performance()
-        text = (
-            f"\U0001f9e0 <b>Claude Shadow Trader</b>\n\n"
-            f"Total Trades: {perf['total_trades']}\n"
-            f"Win Rate: {perf['win_rate']:.0%} "
-            f"({perf['wins']}W / {perf['losses']}L)\n"
-            f"Total PnL: {perf['total_pnl_pips']:+.1f} pips\n"
-            f"Avg PnL: {perf['avg_pnl_pips']:+.1f} pips\n"
-            f"Best: {perf['best_trade_pips']:+.1f} pips\n"
-            f"Worst: {perf['worst_trade_pips']:+.1f} pips\n"
-            f"Open Paper Trades: {perf['open_trades']}"
-        )
-
-        # By instrument breakdown
-        if perf["by_instrument"]:
-            text += "\n\n<b>By Instrument:</b>"
-            for inst, stats in perf["by_instrument"].items():
-                text += (
-                    f"\n{inst}: {stats['trades']} trades, "
-                    f"{stats['win_rate']:.0%} WR, "
-                    f"{stats['pnl_pips']:+.1f} pips"
-                )
-
-        self._send(text)
 
     def daily_summary(
         self,
@@ -468,8 +327,21 @@ class TelegramBot:
         balance: float,
         win_rate: float,
         max_drawdown: float,
+        manager_cycles: Optional[int] = None,
+        manager_adjustments: Optional[int] = None,
+        api_cost_today: Optional[float] = None,
+        net_after_cost_today: Optional[float] = None,
+        net_after_cost_total: Optional[float] = None,
+        verdict_line: Optional[str] = None,
     ):
-        """Send daily summary report."""
+        """
+        Send daily summary report. The manager_* / verdict parameters are
+        optional (Task 14 self-funding scorecard): when provided, a Manager
+        section is appended — cycles run today, adjustments applied, API
+        cost today, net-after-cost P&L today + cumulative, and (from day 8
+        of the API budget window onward) the SELF-FUNDING / NOT JUSTIFIED
+        verdict line.
+        """
         emoji = "\u2705" if pnl >= 0 else "\U0001f534"
 
         text = (
@@ -480,4 +352,19 @@ class TelegramBot:
             f"Max Drawdown: {max_drawdown:.1%}\n"
             f"\U0001f4b0 Balance: R{balance:.2f}"
         )
+
+        if manager_cycles is not None:
+            text += (
+                f"\n\n\U0001f9e0 <b>Manager</b>\n"
+                f"Manager cycles: {manager_cycles} "
+                f"({manager_adjustments or 0} adjustments applied)\n"
+                f"API cost today: R{(api_cost_today or 0.0):.2f}"
+            )
+            if net_after_cost_today is not None:
+                text += f"\nNet after cost today: R{net_after_cost_today:+.2f}"
+            if net_after_cost_total is not None:
+                text += f"\nNet after cost total: R{net_after_cost_total:+.2f}"
+            if verdict_line:
+                text += f"\nVerdict: {verdict_line}"
+
         self._send(text)

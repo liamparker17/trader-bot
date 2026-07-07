@@ -12,11 +12,13 @@ __pycache__/
 # Control plane runtime files (created on the VPS at runtime)
 data/control/
 data/traderbot.lock
+data/account_state.json
 
 # Data files (too large for git)
 data/historical/*.parquet
 data/trade_logs/*.db
 data/trade_logs/*.sqlite
+data/traderbot.lock
 
 # ML models (large binary files)
 src/ml/model_store/*.joblib
@@ -46,3 +48,8 @@ logs/
 CLAUDE.md
 .claude/
 SKILL.md
+control/inbox/
+control/outbox/
+control/deadletter/
+control/effective_config.json
+control/manager_events/

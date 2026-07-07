@@ -11,7 +11,7 @@ Every trade is recorded with full details for:
 import json
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -64,9 +64,14 @@ class TradeJournal:
                     trend_15min INTEGER,
                     indicators_json TEXT,
                     adjustments_json TEXT,
+                    commission REAL DEFAULT 0,
+                    swap REAL DEFAULT 0,
+                    net_pnl_zar REAL,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            self._migrate_fee_columns(conn)
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS daily_summary (
@@ -92,7 +97,103 @@ class TradeJournal:
                 )
             """)
 
+            # Task 8: control queue (tb CLI) command audit trail. A row is
+            # inserted with outcome='pending' when a command is received,
+            # then updated in place once processed.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS control_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_utc TEXT NOT NULL,
+                    verb TEXT NOT NULL,
+                    args_json TEXT,
+                    reason TEXT,
+                    requested_by TEXT,
+                    before_config_json TEXT,
+                    after_config_json TEXT,
+                    outcome TEXT NOT NULL DEFAULT 'pending'
+                )
+            """)
+
+            self._migrate_control_log_columns(conn)
+
+            # Task 12: Claude-manager cycle audit trail. One row per
+            # manager invocation (briefing -> proposals -> validate/clamp
+            # -> enqueue), independent of control_log (which logs the `tb`
+            # CLI's own command queue, including manager-originated tunes
+            # once they reach the queue).
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS manager_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_utc TEXT NOT NULL,
+                    trigger TEXT,
+                    briefing_json TEXT,
+                    model TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cost_zar REAL,
+                    rationale TEXT,
+                    proposals_json TEXT,
+                    applied_json TEXT,
+                    rejected_json TEXT,
+                    outcome TEXT
+                )
+            """)
+
+            self._migrate_manager_log_columns(conn)
+
         logger.info(f"Trade journal initialized: {self.db_path}")
+
+    def _migrate_control_log_columns(self, conn: sqlite3.Connection):
+        """
+        Idempotently add `cmd_id` to `control_log` for DBs created before
+        the crash-replay idempotency fix (Task 8 review). Guarded by
+        PRAGMA table_info so it's safe on every open, including
+        already-migrated (or brand-new) DBs. Used to detect an inbox
+        command that was already processed (e.g. re-dropped after a
+        crash) so it isn't re-executed.
+        """
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(control_log)").fetchall()}
+        if "cmd_id" not in existing:
+            conn.execute("ALTER TABLE control_log ADD COLUMN cmd_id TEXT")
+
+    def _migrate_manager_log_columns(self, conn: sqlite3.Connection):
+        """
+        Idempotently add any future manager_log columns. Guarded by
+        PRAGMA table_info so it's safe on every open, including
+        already-migrated (or brand-new) DBs. No-op today (the table is
+        created with its full column set above) — kept for parity with
+        `_migrate_control_log_columns` / `_migrate_fee_columns` so a future
+        column addition follows the same established convention.
+        """
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(manager_log)").fetchall()}
+        # Placeholder: no columns to backfill yet.
+        _ = existing
+
+    def _migrate_fee_columns(self, conn: sqlite3.Connection):
+        """
+        Idempotently add fee/net-P&L columns to `trades` for DBs created
+        before Task 7. Guarded by PRAGMA table_info so it's safe to run
+        on every open, including already-migrated (or brand-new) DBs.
+        """
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        if "commission" not in existing:
+            conn.execute("ALTER TABLE trades ADD COLUMN commission REAL DEFAULT 0")
+        if "swap" not in existing:
+            conn.execute("ALTER TABLE trades ADD COLUMN swap REAL DEFAULT 0")
+        if "net_pnl_zar" not in existing:
+            conn.execute("ALTER TABLE trades ADD COLUMN net_pnl_zar REAL")
+
+    @staticmethod
+    def compute_net_pnl(gross_pnl: float, commission: float = 0.0, swap: float = 0.0) -> float:
+        """
+        Net P&L = gross + commission + swap.
+
+        Sign convention: MT5 reports both `commission` and `swap` on deal
+        objects as already-signed values, and in the overwhelming majority
+        of cases both are costs and therefore negative. Adding them to the
+        gross P&L yields the true net result without any extra negation.
+        """
+        return gross_pnl + commission + swap
 
     def record_trade(
         self,
@@ -117,8 +218,14 @@ class TradeJournal:
         slippage_pips: float = 0.0,
         spread_at_entry: float = 0.0,
         balance_after: float = None,
+        commission: float = 0.0,
+        swap: float = 0.0,
     ):
         """Record a trade (can be called at open and updated at close)."""
+        net_pnl_zar = (
+            self.compute_net_pnl(pnl_zar, commission, swap)
+            if pnl_zar is not None else None
+        )
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO trades (
@@ -126,8 +233,9 @@ class TradeJournal:
                     exit_price, entry_time, exit_time, stop_loss, take_profit,
                     pnl_pips, pnl_zar, ml_confidence, exit_reason,
                     slippage_pips, spread_at_entry, balance_after,
-                    model_version, trend_15min, indicators_json, adjustments_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    model_version, trend_15min, indicators_json, adjustments_json,
+                    commission, swap, net_pnl_zar
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 trade_id, instrument, direction, units, entry_price,
                 exit_price,
@@ -139,6 +247,7 @@ class TradeJournal:
                 model_version, trend_15min,
                 json.dumps(indicators) if indicators else None,
                 json.dumps(adjustments) if adjustments else None,
+                commission, swap, net_pnl_zar,
             ))
 
     def record_event(self, event_type: str, message: str, data: dict = None):
@@ -233,6 +342,102 @@ class TradeJournal:
         with sqlite3.connect(self.db_path) as conn:
             return pd.read_sql_query(query, conn, params=params)
 
+    def log_control_command(
+        self,
+        verb: str,
+        args: dict = None,
+        reason: str = "",
+        requested_by: str = "",
+        ts_utc: str = None,
+        cmd_id: str = None,
+    ) -> int:
+        """
+        Record an incoming control-queue (`tb` CLI) command as
+        outcome='pending'. Returns the new row id so the caller can later
+        call `update_control_outcome()` once the command has been processed.
+
+        `ts_utc` lets callers (ControlQueue, which has its own injectable
+        clock for testing) supply the timestamp explicitly; defaults to
+        wall-clock UTC now.
+
+        `cmd_id` is the sanitized inbox command id (see ControlQueue). It
+        lets a crash-replay of the same inbox file be recognized as
+        already-processed instead of re-executed (Task 8 review fix).
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("""
+                INSERT INTO control_log
+                (ts_utc, verb, args_json, reason, requested_by, outcome, cmd_id)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?)
+            """, (
+                ts_utc or datetime.now(timezone.utc).isoformat(),
+                verb,
+                json.dumps(args) if args else None,
+                reason,
+                requested_by,
+                cmd_id,
+            ))
+            return cur.lastrowid
+
+    def get_control_log_by_cmd_id(self, cmd_id: str) -> Optional[dict]:
+        """
+        Look up the most recent control_log row for a given `cmd_id`, if
+        any. Used by ControlQueue's replay guard: if a command with this
+        id was already recorded as applied/rejected, a re-dropped inbox
+        file (e.g. after a crash between outbox-write and inbox-unlink)
+        must not be re-executed.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT * FROM control_log WHERE cmd_id = ? ORDER BY id DESC LIMIT 1",
+                (cmd_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row is not None else None
+
+    def update_control_outcome(
+        self,
+        log_id: int,
+        outcome: str,
+        before_config_json: str = None,
+        after_config_json: str = None,
+    ):
+        """Update a control_log row: pending -> applied|rejected|error."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                UPDATE control_log
+                SET outcome = ?,
+                    before_config_json = COALESCE(?, before_config_json),
+                    after_config_json = COALESCE(?, after_config_json)
+                WHERE id = ?
+            """, (outcome, before_config_json, after_config_json, log_id))
+
+    def get_control_log(
+        self,
+        verb: str = None,
+        requested_by: str = None,
+        outcome: str = None,
+        limit: int = 200,
+    ) -> pd.DataFrame:
+        """Query the control_log audit trail, most recent first."""
+        query = "SELECT * FROM control_log WHERE 1=1"
+        params = []
+        if verb:
+            query += " AND verb = ?"
+            params.append(verb)
+        if requested_by:
+            query += " AND requested_by = ?"
+            params.append(requested_by)
+        if outcome:
+            query += " AND outcome = ?"
+            params.append(outcome)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        with sqlite3.connect(self.db_path) as conn:
+            return pd.read_sql_query(query, conn, params=params)
+
     def get_trade_count(self) -> int:
         """Get total number of completed trades."""
         with sqlite3.connect(self.db_path) as conn:
@@ -240,3 +445,96 @@ class TradeJournal:
                 "SELECT COUNT(*) FROM trades WHERE exit_price IS NOT NULL"
             ).fetchone()
             return result[0] if result else 0
+
+    # ------------------------------------------------------------------
+    # Task 12: manager_log (Claude-manager cycle audit trail)
+    # ------------------------------------------------------------------
+
+    def log_manager_cycle(
+        self,
+        trigger: str,
+        briefing: dict = None,
+        model: str = "",
+        input_tokens: int = None,
+        output_tokens: int = None,
+        cost_zar: float = None,
+        rationale: str = "",
+        proposals: list = None,
+        applied: list = None,
+        rejected: list = None,
+        outcome: str = "",
+        ts_utc: str = None,
+    ) -> int:
+        """
+        Record one manager cycle (briefing -> proposals -> validate/clamp)
+        as a single row. Returns the new row id.
+
+        `briefing`, `proposals`, `applied`, `rejected` are JSON-serialized
+        as-is; callers pass plain dicts/lists (already-built briefing dict,
+        already-clamped applied/rejected lists from
+        `src.manager.policy.validate_and_clamp`).
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("""
+                INSERT INTO manager_log (
+                    ts_utc, trigger, briefing_json, model, input_tokens,
+                    output_tokens, cost_zar, rationale, proposals_json,
+                    applied_json, rejected_json, outcome
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                ts_utc or datetime.now(timezone.utc).isoformat(),
+                trigger,
+                json.dumps(briefing) if briefing is not None else None,
+                model,
+                input_tokens,
+                output_tokens,
+                cost_zar,
+                rationale,
+                json.dumps(proposals) if proposals is not None else None,
+                json.dumps(applied) if applied is not None else None,
+                json.dumps(rejected) if rejected is not None else None,
+                outcome,
+            ))
+            return cur.lastrowid
+
+    def get_manager_log(
+        self,
+        days: int = None,
+        limit: int = None,
+    ) -> pd.DataFrame:
+        """
+        Query the manager_log audit trail, most recent first.
+
+        `days`: only rows with ts_utc within the last N days.
+        `limit`: cap the number of rows returned (None = no cap).
+        """
+        query = "SELECT * FROM manager_log WHERE 1=1"
+        params: list = []
+
+        if days is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            query += " AND ts_utc >= ?"
+            params.append(cutoff)
+
+        query += " ORDER BY id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        with sqlite3.connect(self.db_path) as conn:
+            return pd.read_sql_query(query, conn, params=params)
+
+    def manager_cost_since(self, ts) -> float:
+        """
+        Sum `cost_zar` for all manager_log rows with ts_utc >= ts.
+
+        `ts` may be a datetime (converted to isoformat) or an ISO-8601
+        string. Rows with a NULL cost_zar are treated as 0.
+        """
+        ts_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
+        with sqlite3.connect(self.db_path) as conn:
+            result = conn.execute(
+                "SELECT COALESCE(SUM(cost_zar), 0) FROM manager_log WHERE ts_utc >= ?",
+                (ts_str,),
+            ).fetchone()
+            return float(result[0]) if result else 0.0

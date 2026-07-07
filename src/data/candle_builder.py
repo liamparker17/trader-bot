@@ -12,6 +12,8 @@ from typing import Optional, Callable
 
 import pandas as pd
 
+from src.utils.timeutil import to_utc
+
 logger = logging.getLogger("traderbot.candles")
 
 
@@ -95,7 +97,7 @@ class CandleBuilder:
             return  # Skip heartbeats
 
         instrument = tick["instrument"]
-        timestamp = datetime.fromisoformat(tick["time"].replace("Z", "+00:00"))
+        timestamp = to_utc(datetime.fromisoformat(tick["time"].replace("Z", "+00:00")))
 
         # Use mid price (average of bid and ask)
         bid = float(tick["bids"][0]["price"])
@@ -234,7 +236,7 @@ class CandleBuilder:
 
         for ts, row in candles_df.iterrows():
             candle = Candle(
-                timestamp=ts if isinstance(ts, datetime) else pd.Timestamp(ts).to_pydatetime(),
+                timestamp=to_utc(ts if isinstance(ts, datetime) else pd.Timestamp(ts).to_pydatetime()),
                 open=row["open"],
                 high=row["high"],
                 low=row["low"],

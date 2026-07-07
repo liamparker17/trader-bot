@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from src.config import Config
+from src.manager.events import drop_manager_event
+from src.risk.ratchet_floor import RatchetFloor
 
 logger = logging.getLogger("traderbot.risk.breaker")
 
@@ -33,17 +35,32 @@ class CircuitBreaker:
     6. Daily/weekly drawdown → handled by DrawdownTracker
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, ratchet_floor: Optional[RatchetFloor] = None):
         self.config = config
 
         # Thresholds from config
         self.consec_loss_reduce = config.get("risk.consecutive_loss_reduce_at", 3)
         self.consec_loss_pause = config.get("risk.consecutive_loss_pause_at", 5)
+        self.manager_event_consecutive_losses = config.get(
+            "manager.event_triggers.consecutive_losses", 3
+        )
+        self.manager_event_on_circuit_breaker = config.get(
+            "manager.event_triggers.circuit_breaker", True
+        )
         self.pause_duration_min = config.get("risk.pause_duration_minutes", 30)
         self.min_win_rate = config.get("risk.min_win_rate_threshold", 0.45)
         self.win_rate_lookback = config.get("risk.min_win_rate_lookback", 100)
-        self.hard_floor = config.get("account.hard_floor_zar", 350)
         self.max_spread_mult = config.get("risk.max_spread_multiplier", 2.0)
+
+        # Ratcheting hard floor (replaces the old fixed hard_floor_zar kill
+        # switch). Injected by callers that own the shared account state
+        # (see src/risk/manager.py); falls back to a self-constructed
+        # instance using the safety_floor.yaml defaults so this class still
+        # works standalone (e.g. in tests).
+        self.ratchet_floor = ratchet_floor or RatchetFloor(
+            min_floor_zar=config.get("risk.min_floor_zar", 600),
+            max_total_drawdown_pct=config.get("risk.max_total_drawdown_pct", 0.35),
+        )
 
         # State
         self.consecutive_losses: int = 0
@@ -57,7 +74,9 @@ class CircuitBreaker:
         # API error tracking
         self.api_errors: list[float] = []  # timestamps
         self.api_error_window = 600  # 10 minutes
-        self.api_error_limit = 5
+        # Sourced from config/safety_floor.yaml (circuit_breaker section),
+        # overlaid into settings by load_config(); the safety file wins.
+        self.api_error_limit = config.get("circuit_breaker.api_error_threshold", 5)
 
         # Spread tracking per instrument
         self.blocked_instruments: dict[str, str] = {}  # instrument → reason
@@ -73,6 +92,11 @@ class CircuitBreaker:
         else:
             self.consecutive_losses += 1
             logger.info(f"Consecutive losses: {self.consecutive_losses}")
+            if self.consecutive_losses == self.manager_event_consecutive_losses:
+                drop_manager_event(
+                    "consecutive_losses",
+                    {"consecutive_losses": self.consecutive_losses},
+                )
 
         # Check consecutive loss pause
         if self.consecutive_losses >= self.consec_loss_pause:
@@ -126,10 +150,11 @@ class CircuitBreaker:
         return True
 
     def check_balance(self, balance: float) -> bool:
-        """Check if balance is above hard floor. Returns True if OK."""
-        if balance <= self.hard_floor:
+        """Check if balance is above the ratcheting hard floor. Returns True if OK."""
+        floor = self.ratchet_floor.update(balance)
+        if self.ratchet_floor.is_breached(balance):
             self._shutdown(
-                f"HARD FLOOR BREACH: Balance R{balance:.2f} <= R{self.hard_floor}"
+                f"HARD FLOOR BREACH: Balance R{balance:.2f} <= R{floor:.2f}"
             )
             return False
         return True
@@ -220,6 +245,16 @@ class CircuitBreaker:
         self.blocked_instruments.clear()
         logger.info("Circuit breaker reset")
 
+    def reset_consecutive_losses(self):
+        """
+        Reset only the consecutive-loss counter. Called by the risk manager
+        at every 21:00 UTC session boundary — unlike reset(), this does NOT
+        touch pause/shutdown state, blocked instruments, or the rolling
+        win-rate window (recent_outcomes), which are not session-scoped.
+        """
+        self.consecutive_losses = 0
+        logger.info("Consecutive-loss counter reset (session boundary)")
+
     def force_resume(self):
         """Force resume from pause state (manual override)."""
         if self.is_shutdown:
@@ -234,6 +269,8 @@ class CircuitBreaker:
         self.pause_reason = reason
         self.pause_until = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
         logger.warning(f"CIRCUIT BREAKER PAUSE: {reason} (for {duration_minutes} min)")
+        if self.manager_event_on_circuit_breaker:
+            drop_manager_event("circuit_breaker_trip", {"reason": reason, "action": "pause"})
 
     def _unpause(self):
         """Deactivate pause."""
@@ -247,6 +284,8 @@ class CircuitBreaker:
         self.is_shutdown = True
         self.shutdown_reason = reason
         logger.critical(f"CIRCUIT BREAKER SHUTDOWN: {reason}")
+        if self.manager_event_on_circuit_breaker:
+            drop_manager_event("circuit_breaker_trip", {"reason": reason, "action": "shutdown"})
 
     def get_status(self) -> dict:
         """Get current circuit breaker status for monitoring."""
